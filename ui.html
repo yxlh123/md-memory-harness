@@ -36,6 +36,14 @@
   button.primary { background: var(--accent); border: none; color: #10131a; font-weight: 600; padding: 9px 18px; border-radius: 8px; cursor: pointer; }
   button.primary:disabled { opacity: .5; cursor: wait; }
 
+  /* 待发图片 */
+  #attachbar { display: none; gap: 8px; padding: 8px 10% 0; background: var(--panel); flex-wrap: wrap; }
+  #attachbar.on { display: flex; }
+  .thumb { position: relative; width: 64px; height: 64px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb button { position: absolute; top: 0; right: 0; background: rgba(0,0,0,.65); border: none; color: #fff; width: 18px; height: 18px; line-height: 1; font-size: 12px; cursor: pointer; border-radius: 0 0 0 6px; }
+  #pick { padding: 7px 10px; font-size: 15px; }
+
   /* 记忆 */
   .pane { flex: 1; overflow-y: auto; padding: 18px 10%; display: flex; flex-direction: column; gap: 14px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
@@ -84,7 +92,10 @@
 <main>
   <section class="tab on" id="tab-chat">
     <div id="chatlog"></div>
+    <div id="attachbar"></div>
     <div id="chatbar">
+      <button class="ghost" id="pick" title="发图片（也可以直接 Ctrl+V 粘贴截图）">📎</button>
+      <input type="file" id="pickfile" accept="image/png,image/jpeg,image/webp,image/gif" multiple style="display:none">
       <input id="msg" placeholder="输入消息，Enter 发送（回答会结合本地记忆）" autofocus>
       <button class="primary" id="send">发送</button>
     </div>
@@ -170,6 +181,8 @@ function renderAll() {
 }
 
 /* ---------- 对话 ---------- */
+let attachments = [];   // 待发图片（data URL），最多 4 张
+
 function addMsg(cls, text) {
   const el = document.createElement('div');
   el.className = 'msg ' + cls;
@@ -178,15 +191,48 @@ function addMsg(cls, text) {
   $('#chatlog').scrollTop = 1e9;
   return el;
 }
+
+function renderAttach() {
+  const bar = $('#attachbar');
+  bar.innerHTML = '';
+  bar.classList.toggle('on', attachments.length > 0);
+  attachments.forEach((url, i) => {
+    const d = document.createElement('div');
+    d.className = 'thumb';
+    const im = document.createElement('img');
+    im.src = url;
+    d.appendChild(im);
+    const x = document.createElement('button');
+    x.textContent = '×';
+    x.title = '移除';
+    x.onclick = () => { attachments.splice(i, 1); renderAttach(); };
+    d.appendChild(x);
+    bar.appendChild(d);
+  });
+}
+
+function addFiles(files) {
+  [...files].forEach(f => {
+    if (!f || !/^image\/(png|jpeg|webp|gif)$/.test(f.type)) { toast('只支持 png / jpg / webp / gif'); return; }
+    if (f.size > 6 * 1024 * 1024) { toast('单张图别超过 6MB'); return; }
+    if (attachments.length >= 4) { toast('一条消息最多 4 张图'); return; }
+    const r = new FileReader();
+    r.onload = () => { attachments.push(r.result); renderAttach(); };
+    r.readAsDataURL(f);
+  });
+}
+
 async function send() {
   const box = $('#msg'), text = box.value.trim(), btn = $('#send');
-  if (!text) return;
-  box.value = ''; btn.disabled = true;
-  addMsg('user', text);
+  if (!text && !attachments.length) return;
+  const imgs = attachments.slice();
+  box.value = ''; attachments = []; renderAttach();
+  btn.disabled = true;
+  addMsg('user', (imgs.length ? '📎 图片 ' + imgs.length + ' 张' + (text ? '\n' : '') : '') + text);
   const pend = addMsg('ai', '…');
   try {
-    const j = await api('/api/chat', {message: text, history: history, summary: summary,
-                                      blocks: blocks});
+    const j = await api('/api/chat', {message: text || '（请看这张图）', history: history,
+                                      summary: summary, blocks: blocks, images: imgs});
     pend.textContent = j.reply;
     history = j.history || history.concat([{role: 'user', content: text},
                                            {role: 'assistant', content: j.reply}]);
@@ -202,6 +248,17 @@ async function send() {
 }
 $('#send').onclick = send;
 $('#msg').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+$('#pick').onclick = () => $('#pickfile').click();
+$('#pickfile').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+// 直接 Ctrl+V 粘贴截图
+$('#msg').addEventListener('paste', e => {
+  const files = [...((e.clipboardData && e.clipboardData.items) || [])]
+    .filter(i => i.kind === 'file' && i.type.startsWith('image/'))
+    .map(i => i.getAsFile()).filter(Boolean);
+  if (!files.length) return;
+  e.preventDefault();
+  addFiles(files);
+});
 
 /* ---------- 记忆 ---------- */
 function renderMemories() {

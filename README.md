@@ -25,6 +25,7 @@
 - **三级回退检索**：命中明确给摘要 + 开头，命中偏弱给命中词附近的片段，完全没命中就只给最近几条并明确标注——不会因为"没搜到"就把整个库倒进 prompt。
 - **对话摘要压缩**：历史超过字符预算时，把较早的对话压成摘要，原文写进 `journal/c1.md`、`c2.md`…，摘要里带块号，`log show c1` 可回读全文。
 - **可换模型**：任何 OpenAI 兼容接口都行（本地 Ollama / 智谱 / DeepSeek / vLLM…）。
+- **能发图片**：命令行 `--image` / `/img`，网页端点 📎 或直接 Ctrl+V 粘贴截图。图片落盘到 `journal/images/`，上下文里只留路径标记，base64 不进 md。
 - **两个界面**：命令行 `harness.py`，网页 `webui.py`（标准库 `http.server`，只监听 `127.0.0.1`）。
 
 ## 快速开始
@@ -67,8 +68,8 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | 命令 | 作用 |
 | --- | --- |
 | `save <内容> [--type user\|feedback\|project\|reference] [--no-llm]` | 存一条记忆，默认让模型起名/写描述/判类型 |
-| `chat [--budget N]` | 连续对话；`/save`、`/search`、`/list`、`/history`、`/new`、`/exit` |
-| `ask <问题>` | 单次问答（检索记忆后提问） |
+| `chat [--budget N] [--image 图]` | 连续对话；`/save`、`/search`、`/list`、`/history`、`/img`、`/new`、`/exit` |
+| `ask <问题> [--image 图]` | 单次问答（检索记忆后提问），可附图 |
 | `list` | 列出全部记忆 |
 | `search <词>` | 按索引搜索，按命中率排序 |
 | `show <名字>` | 查看全文（文件名或 frontmatter 的 `name` 都认） |
@@ -79,6 +80,32 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | `config [set <key> <value>]` | 查看/写入配置 |
 
 网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config}`。
+
+## 图片
+
+只对**支持读图的模型**有效（qwen3-vl、qwen2.5-vl、glm-4v、gpt-4o、claude 之类）。模型不支持时接口会报错，`chat` 里会提示你换模型。
+
+```bash
+python harness.py ask "这张图里的报错是什么意思" --image .\errcode.png
+python harness.py chat --image .\chat1.png      # 开场先挂一张
+```
+
+对话里随时挂图：
+
+```text
+你> /img C:\Users\me\Desktop\shot.png
+(已挂 1 张图，下一句一起发)
+你> 帮我看看这个界面哪不对
+```
+
+网页端点输入框左边的 📎，或者截完图直接在输入框里 Ctrl+V。
+
+几个约定：
+
+- 图片存到 `journal/images/<时间戳>-<随机>.png`，**原文里只写路径**（`[图片 journal/images/…]`），base64 不进 md，`grep` 也不会被几十兆的字符串卡住。
+- 一张图按 `IMG_WEIGHT = 1200` 字符计入对话预算，压缩时图片和它的路径一起进 `journal/cN.md`；回读时看到的是路径，不是图。
+- 单张上限 6MB、一条消息最多 4 张、请求体上限 24MB（`webui.py` 的 `MAX_IMAGE_BYTES` / `MAX_IMAGES` / `MAX_BODY`）。
+- 图片以 data URL 形式发给模型，走的是 OpenAI 多模态格式 `content: [{type:"text"}, {type:"image_url"}]`；老接口只认纯文本的话这条路走不通。
 
 ## 记忆文件长这样
 
@@ -148,11 +175,12 @@ created: 2026-11-18
 - **`api_key` 明文存在 `config.json`**：文件不进 git（`.gitignore` 已排除），但本机其他程序可读。在意的话用环境变量。
 - **单进程单用户**：没有文件锁，同时开两个 `webui.py` 写同一条记忆可能互相覆盖。
 - **摘要质量取决于模型**：模型越小摘要越糊，但原文在 `journal/` 里，随时能捞。
+- **图片没做压缩**：6MB 的截图会原样存盘、原样发给模型，多轮带同一张图会重复计费；要省就自己先缩图。
 
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 15 个用例，不联网
+python -m unittest discover -s tests -v     # 26 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 

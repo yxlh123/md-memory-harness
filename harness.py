@@ -18,6 +18,7 @@
   MEMORY_DIR / MEMORY_LLM_BASE_URL / MEMORY_LLM_API_KEY / MEMORY_LLM_MODEL
 """
 import argparse
+import base64
 import datetime
 import json
 import os
@@ -25,6 +26,7 @@ import re
 import sys
 import urllib.parse
 import urllib.request
+import uuid
 
 try:  # Windows 控制台默认 GBK，避免打印中文报错
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -32,7 +34,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -76,6 +78,8 @@ INDEX_FILE = os.path.join(MEM_DIR, "MEMORY.md")      # 给人看的索引
 IDX_FILE = os.path.join(MEM_DIR, ".index.json")      # 给程序用的索引
 TRASH_DIR = os.path.join(MEM_DIR, ".trash")
 JOURNAL_DIR = os.path.join(ROOT, "journal")          # 对话原文（摘要里的块号指向这里）
+IMG_WEIGHT = 1200                                    # 一张图折算多少字符的对话预算
+MAX_IMAGE_BYTES = 6 * 1024 * 1024                     # 单张图片上限 6MB
 
 TYPES = ("user", "feedback", "project", "reference")
 MEM_EXTS = (".md", ".markdown", ".txt")
@@ -83,12 +87,25 @@ FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.S)
 CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 
 CHAT_SYS = ("你是基于本地 Markdown 记忆库的对话助手。回答尽量结合给出的记忆，"
-            "记忆里没有的就直说，不要编造。回答保持简洁。")
+            "记忆里没有的就直说，不要编造。回答保持简洁。"
+            "用户发来图片时，直接看图回答（描述内容、认字、找问题都行），不要因为记忆里没写就拒答。")
 ASK_SYS = ("你是基于本地记忆的问答助手。只依据给出的记忆回答，记忆里没有的就直说，"
-           "不要编造。回答末尾列出用到的记忆 name。")
+           "不要编造。用户附了图片时，图片内容算作给出的信息，照实描述即可。"
+           "回答末尾列出用到的记忆 name。")
 
 
 # ---------- 存储层 ----------
+
+def _atomic_write_bytes(path, data):
+    """二进制版的原子写（图片用）。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 
 def _atomic_write(path, text):
     """原子写：写临时文件 → fsync → 改名覆盖。中途断电不会留下半个文件。"""
@@ -512,6 +529,78 @@ def list_journal():
                   key=lambda s: (len(s), s))
 
 
+# ---------- 图片（多模态输入） ----------
+
+_IMG_EXT = {"png": "png", "jpeg": "jpg", "jpg": "jpg", "webp": "webp", "gif": "gif"}
+_IMG_RE = re.compile(r"\Adata:image/([A-Za-z0-9.+-]+);base64,", re.I)
+
+
+def img_dir():
+    return os.path.join(JOURNAL_DIR, "images")
+
+
+def img_decode(data_url):
+    """data:image/png;base64,xxx → (扩展名, 原始字节)。"""
+    m = _IMG_RE.match(data_url or "")
+    if not m:
+        raise ValueError("图片必须是 data:image/*;base64, 形式")
+    ext = _IMG_EXT.get(m.group(1).lower())
+    if not ext:
+        raise ValueError(f"只支持 png/jpg/webp/gif，收到 {m.group(1)}")
+    try:
+        raw = base64.b64decode(data_url[m.end():], validate=True)
+    except Exception:
+        raise ValueError("图片 base64 解不开")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError(f"图片太大（{len(raw)} 字节，上限 {MAX_IMAGE_BYTES}）")
+    return ext, raw
+
+
+def file_to_data_url(path):
+    """本地图片文件 → data URL（命令行用）。"""
+    if not os.path.isfile(path):
+        raise SystemExit(f"找不到图片：{path}")
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    mime = _IMG_EXT.get(ext)
+    if not mime:
+        raise SystemExit(f"只支持 png/jpg/webp/gif：{path}")
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise SystemExit(f"图片太大（{len(raw)} 字节，上限 {MAX_IMAGE_BYTES}）")
+    return f"data:image/{mime};base64," + base64.b64encode(raw).decode()
+
+
+def persist_image(data_url):
+    """把图片落盘到 journal/images/，返回相对路径。
+
+    原文只留路径，绝不把 base64 写进 md——否则 journal 会被几十兆的字符串撑爆。
+    """
+    ext, raw = img_decode(data_url)
+    os.makedirs(img_dir(), exist_ok=True)
+    name = f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}.{ext}"
+    path = os.path.join(img_dir(), name)
+    _atomic_write_bytes(path, raw)
+    return os.path.relpath(path, ROOT).replace(os.sep, "/")
+
+
+def text_of(content):
+    """把 str 或 OpenAI 多模态 parts 统一成纯文本。"""
+    if isinstance(content, str):
+        return content
+    out = []
+    for p in content or []:
+        if isinstance(p, dict) and p.get("type") == "text":
+            out.append(p.get("text") or "")
+    return "\n".join(x for x in out if x)
+
+
+def count_images(content):
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+
+
 def _local_summary(text, max_chars=400):
     """没有 LLM 时的降级摘要：保留头尾，中间省略。有 LLM 时不用它。"""
     flat = " ".join(text.split())
@@ -558,18 +647,26 @@ class ChatSession:
         return s
 
     def state(self):
-        return {"history": self.messages, "summary": self.summary, "blocks": self.blocks}
+        # 图片只回传文字标记（路径），base64 不进浏览器 state，否则每条请求都是几兆
+        return {"history": [{"role": m["role"], "content": text_of(m["content"])}
+                            for m in self.messages],
+                "summary": self.summary, "blocks": self.blocks}
 
     # -- 压缩 --
     def size(self):
-        return sum(len(m["content"]) for m in self.messages)
+        total = 0
+        for m in self.messages:
+            total += len(text_of(m["content"]))
+            total += IMG_WEIGHT * count_images(m["content"])
+        return total
 
     def compact_if_needed(self):
         if self.size() <= self.budget or len(self.messages) <= self.keep_recent:
             return False
         chunk = self.messages[:-self.keep_recent]
         self.messages = self.messages[-self.keep_recent:]
-        text = "\n".join(f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}" for m in chunk)
+        text = "\n".join(f"{'用户' if m['role'] == 'user' else '助手'}: {text_of(m['content'])}"
+                         for m in chunk)
         block = f"c{len(self.blocks) + 1}"
         _journal_write(block, text)
         self.blocks.append(block)
@@ -577,17 +674,26 @@ class ChatSession:
         return True
 
     # -- 提问 --
-    def ask(self, question):
+    def ask(self, question, images=None):
+        """images：data URL 列表。图片落盘到 journal/images/，进 prompt 用 image_url。"""
         r = retrieve(question)
         sys_prompt = CHAT_SYS
         if r["text"]:
             sys_prompt += f"\n\n# 本地记忆（{r['tier']} 级，{r['count']} 条）\n{r['text']}"
         if self.summary:
             sys_prompt += f"\n\n# 较早对话的摘要（原文可用 `log show <块号>` 回读）\n{self.summary}"
+        content = question
+        if images:
+            parts = [{"type": "text", "text": question}]
+            for url in images:
+                rel = persist_image(url)
+                parts.append({"type": "text", "text": f"[图片 {rel}]"})
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+            content = parts
         msgs = [{"role": "system", "content": sys_prompt}] + self.messages + \
-               [{"role": "user", "content": question}]
+               [{"role": "user", "content": content}]
         answer = llm(msgs, temperature=0.6)
-        self.messages += [{"role": "user", "content": question},
+        self.messages += [{"role": "user", "content": content},
                           {"role": "assistant", "content": answer}]
         self.compact_if_needed()
         return answer, r
@@ -673,13 +779,20 @@ def cmd_show(a):
 
 def cmd_ask(a):
     question = " ".join(a.question)
+    images = [file_to_data_url(p) for p in (getattr(a, "image", None) or [])]
     r = retrieve(question)
-    if r["count"] == 0:
+    if r["count"] == 0 and not images:
         sys.exit("本地还没有记忆。")
     print(f"[模型 {MODEL} | {r['tier']} 级检索，带入 {r['count']} 条：{', '.join(r['names'])}]")
+    content = f"# 记忆库\n{r['text']}\n\n# 问题\n{question}"
+    if images:
+        content = [{"type": "text", "text": content}]
+        for url in images:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        print(f"[附 {len(images)} 张图]")
     answer = llm([
         {"role": "system", "content": ASK_SYS},
-        {"role": "user", "content": f"# 记忆库\n{r['text']}\n\n# 问题\n{question}"},
+        {"role": "user", "content": content},
     ])
     print(answer)
 
@@ -687,11 +800,15 @@ def cmd_ask(a):
 def cmd_chat(a):
     idx = load_index()
     sess = ChatSession(budget=a.budget)
+    pending = [file_to_data_url(p) for p in (getattr(a, "image", None) or [])]
     print(f"md-memory-harness {VERSION} 对话模式")
     print(f"模型 {MODEL} @ {BASE_URL} | 记忆 {len(idx['entries'])} 条 | "
           f"历史预算 {sess.budget} 字符（超了自动摘要）")
     print("命令：/save <内容> 存记忆 | /search <词> | /list | /history 看摘要 | "
-          "/new 清空 | /exit 退出\n")
+          "/img <图片路径> 挂图 | /new 清空 | /exit 退出")
+    if pending:
+        print(f"（已挂 {len(pending)} 张图，随第一句一起发）")
+    print()
     while True:
         try:
             line = input("你> ").strip()
@@ -704,6 +821,7 @@ def cmd_chat(a):
             break
         if line == "/new":
             sess = ChatSession(budget=sess.budget)
+            pending = []
             print("(已清空本轮对话，记忆保留)\n")
             continue
         if line == "/list":
@@ -713,6 +831,18 @@ def cmd_chat(a):
         if line == "/history":
             print(sess.summary or "（还没有压缩过，完整对话都在上下文里）")
             print(f"块号：{', '.join(sess.blocks) or '（无）'}\n")
+            continue
+        if line.startswith("/img"):
+            path = line[len("/img"):].strip()
+            if not path:
+                print("用法：/img C:\\path\\pic.png（可连挂多张，下一句一起发）\n")
+                continue
+            try:
+                pending.append(file_to_data_url(path))
+            except SystemExit as e:
+                print(f"({e})\n")
+                continue
+            print(f"(已挂 {len(pending)} 张图，下一句一起发)\n")
             continue
         if line.startswith("/search "):
             print_search(line[len("/search "):].strip())
@@ -725,9 +855,18 @@ def cmd_chat(a):
             print()
             continue
         try:
-            answer, r = sess.ask(line)
+            answer, r = sess.ask(line, pending)
+            pending = []
+        except ValueError as e:
+            print(f"(图片有问题：{e})")
+            print()
+            continue
         except Exception as e:
+            msg = str(e)
             print(f"(调用失败：{e})")
+            if pending:
+                print("   提示：如果报的是 vision / image 相关错误，"
+                      "说明当前模型（%s）不支持读图，换 qwen2.5-vl、glm-4v、gpt-4o 这类多模态模型。" % MODEL)
             print()
             continue
         print(f"AI> {answer}")
@@ -832,10 +971,14 @@ def main():
 
     p = sub.add_parser("chat", help="对话模式：带记忆的连续对话（超预算自动摘要）")
     p.add_argument("--budget", type=int, default=None, help="历史字符预算，默认取配置")
+    p.add_argument("--image", action="append", metavar="路径",
+                   help="开场先挂一张图（可重复；对话中也可用 /img <路径>）")
     p.set_defaults(func=cmd_chat)
 
     p = sub.add_parser("ask", help="带着记忆问 LLM（单次问答）")
     p.add_argument("question", nargs="+", help="问题")
+    p.add_argument("--image", action="append", metavar="路径",
+                   help="附一张图（可重复），需要模型支持读图")
     p.set_defaults(func=cmd_ask)
 
     p = sub.add_parser("list", help="列出全部记忆")

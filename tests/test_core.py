@@ -191,5 +191,134 @@ class TestChatCompaction(unittest.TestCase):
         self.assertEqual(s3.blocks, ["c1"])
 
 
+PNG_1PX = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlE"
+           "QVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+
+class TestImages(unittest.TestCase):
+    def setUp(self):
+        reset()
+
+    def test_persist_image_writes_file_and_returns_path(self):
+        rel = harness.persist_image(PNG_1PX)
+        self.assertIn("journal/images/", rel)
+        self.assertTrue(os.path.isfile(os.path.join(harness.ROOT, rel)), rel)
+        self.assertNotIn("base64", rel)
+
+    def test_bad_image_rejected(self):
+        with self.assertRaises(ValueError):
+            harness.img_decode("data:image/bmp;base64,AAAA")
+        with self.assertRaises(ValueError):
+            harness.img_decode("http://example.com/a.png")
+
+    def test_image_counts_toward_budget(self):
+        s = harness.ChatSession(budget=100, keep_recent=1)
+        s.messages = [{"role": "user", "content": [
+            {"type": "text", "text": "看图"},
+            {"type": "image_url", "image_url": {"url": PNG_1PX}}]}]
+        self.assertGreaterEqual(s.size(), harness.IMG_WEIGHT)
+
+    def test_compaction_writes_path_not_base64(self):
+        """压进 journal 的是图片路径标记，绝不能是几十兆的 base64。"""
+        rel = harness.persist_image(PNG_1PX)
+        s = harness.ChatSession(budget=100, keep_recent=1)
+        s.messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "这张图"},
+                {"type": "text", "text": f"[图片 {rel}]"},
+                {"type": "image_url", "image_url": {"url": PNG_1PX}}]},
+            {"role": "assistant", "content": "看到了"},
+            {"role": "user", "content": "再说一次 " + "补充" * 40},
+            {"role": "assistant", "content": "好"}]
+        self.assertTrue(s.compact_if_needed())
+        c1 = open(os.path.join(harness.JOURNAL_DIR, "c1.md"), encoding="utf-8").read()
+        self.assertIn("这张图", c1)
+        self.assertIn(rel, c1)
+        self.assertNotIn("base64", c1)
+
+    def test_state_strips_images(self):
+        """网页端 state 只回传文字，否则每轮请求都带几兆 base64。"""
+        s = harness.ChatSession()
+        s.messages = [{"role": "user", "content": [
+            {"type": "text", "text": "图"},
+            {"type": "image_url", "image_url": {"url": PNG_1PX}}]}]
+        st = s.state()
+        self.assertEqual(st["history"][0]["content"], "图")
+
+    def test_ask_sends_multimodal_and_persists(self):
+        seen = {}
+
+        def fake_llm(msgs, **kw):
+            seen["msgs"] = msgs
+            return "ok"
+
+        orig = harness.llm
+        harness.llm = fake_llm
+        try:
+            s = harness.ChatSession()
+            ans, _ = s.ask("这是什么", [PNG_1PX])
+        finally:
+            harness.llm = orig
+        self.assertEqual(ans, "ok")
+        user = seen["msgs"][-1]["content"]
+        self.assertIsInstance(user, list)
+        self.assertIn("image_url", [p["type"] for p in user])
+        self.assertTrue(any("journal/images/" in p.get("text", "") for p in user))
+        self.assertEqual(len(os.listdir(harness.img_dir())), 1)
+
+
+class TestWebApi(unittest.TestCase):
+    """网页端 handler 的往返：图片校验、剥图、压缩续号（不真的起服务器）。"""
+
+    def setUp(self):
+        reset()
+        import webui
+        self.webui = webui
+        self._llm = harness.llm
+        self._budget = harness.CFG.get("history_budget")
+        harness.llm = lambda msgs, **kw: "好的"
+
+    def tearDown(self):
+        harness.llm = self._llm
+        harness.CFG["history_budget"] = self._budget
+
+    def _hist(self, n, size=20):
+        return [{"role": "user" if i % 2 == 0 else "assistant",
+                 "content": "第%d轮 " % i + "内容" * size} for i in range(n)]
+
+    def test_rejects_non_image(self):
+        out = self.webui.handle_api("/api/chat", {"message": "hi",
+                                                  "images": ["data:text/plain;base64,AAA"]})
+        self.assertIn("error", out)
+
+    def test_rejects_too_many_images(self):
+        out = self.webui.handle_api("/api/chat", {"message": "hi",
+                                                  "images": [PNG_1PX] * 5})
+        self.assertIn("error", out)
+
+    def test_chat_with_image_compacts_and_keeps_block_numbers(self):
+        harness.CFG["history_budget"] = 300
+        out = self.webui.handle_api("/api/chat", {
+            "message": "这张图什么颜色", "history": self._hist(10), "summary": "",
+            "blocks": [], "images": [PNG_1PX]})
+        self.assertNotIn("error", out, out)
+        self.assertEqual(out["blocks"], ["c1"])
+        self.assertEqual(out["images"], 1)
+        for m in out["history"]:                     # 回传的 state 必须已经把图剥掉
+            self.assertIsInstance(m["content"], str)
+            self.assertNotIn("base64", m["content"])
+        self.assertIn("journal/images/", out["history"][-2]["content"],
+                      "图片要落成路径标记，而不是留在上下文里当 base64")
+        for f in os.listdir(harness.JOURNAL_DIR):
+            p = os.path.join(harness.JOURNAL_DIR, f)
+            if os.path.isfile(p):
+                self.assertNotIn("base64", open(p, encoding="utf-8").read(), f)
+
+        out2 = self.webui.handle_api("/api/chat", {
+            "message": "再说一遍", "history": self._hist(10) + out["history"],
+            "summary": out["summary"], "blocks": out["blocks"], "images": [PNG_1PX]})
+        self.assertEqual(out2["blocks"], ["c1", "c2"], "第二块不能覆盖 c1")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

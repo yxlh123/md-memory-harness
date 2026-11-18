@@ -55,20 +55,47 @@ def api_error(msg):
     return {"error": msg}
 
 
+MAX_IMAGES = 4                      # 一条消息最多几张图
+MAX_BODY = 24 * 1024 * 1024         # 整个请求体上限（4 张 6MB 的图，base64 后约 32MB，留够）
+
+
+def clean_images(raw):
+    """校验前端传来的图片 data URL；返回 (图片列表, 错误信息)。"""
+    if not raw:
+        return [], None
+    if not isinstance(raw, list):
+        return [], "images 必须是数组"
+    if len(raw) > MAX_IMAGES:
+        return [], f"一条消息最多 {MAX_IMAGES} 张图"
+    out = []
+    for url in raw:
+        if not isinstance(url, str) or not url.startswith("data:image/"):
+            return [], "图片格式不对（需要 data:image/...;base64,...）"
+        try:
+            harness.img_decode(url)     # 只校验，不落盘；落盘在 ChatSession.ask 里做
+        except ValueError as e:
+            return [], str(e)
+        out.append(url)
+    return out, None
+
+
 def handle_api(path, body):
     """分发 POST /api/*，返回结果 dict。异常向上抛，由 Handler 统一转 500。"""
     if path == "/api/chat":
         msg = body.get("message", "").strip()
         if not msg:
             return api_error("消息为空")
+        images, err = clean_images(body.get("images"))
+        if err:
+            return api_error(err)
         sess = harness.ChatSession.from_state(body.get("history", []), body.get("summary", ""),
                                               body.get("blocks", []))
         try:
-            reply, r = sess.ask(msg)
+            reply, r = sess.ask(msg, images)
         except Exception as e:
             return api_error(f"调用模型失败：{e}")
         out = {"reply": reply, "tier": r["tier"], "used_memories": r["count"],
-               "used_names": r["names"]}
+               "used_names": r["names"], "images": len(images)}
         out.update(sess.state())          # history / summary / blocks 回传给浏览器保存
         return out
 
@@ -129,7 +156,7 @@ def handle_api(path, body):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MemoryHarnessUI/2.0"
+    server_version = "MemoryHarnessUI/2.1"
 
     def _send(self, code, ctype, payload):
         self.send_response(code)
@@ -152,6 +179,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urllib.parse.urlsplit(self.path).path
         length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > MAX_BODY:
+            # 先把请求体读掉再回错误：不然对方还在写，连接会被 reset，前端看不到这条消息
+            left = min(length, MAX_BODY + 16 * 1024 * 1024)
+            while left > 0:
+                chunk = self.rfile.read(min(1 << 16, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+            self.close_connection = True
+            self._send(413, "application/json; charset=utf-8",
+                       json.dumps(api_error(f"请求太大（{length} 字节，上限 {MAX_BODY}）："
+                                            f"图片别超过 {MAX_IMAGES} 张、单张 6MB"),
+                                  ensure_ascii=False).encode("utf-8"))
+            return
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
             result = handle_api(path, body)
