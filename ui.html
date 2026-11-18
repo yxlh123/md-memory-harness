@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>记忆Harness</title>
+<style>
+  :root {
+    --bg: #16171a; --panel: #222428; --panel2: #2a2d32; --line: #33363c;
+    --text: #e6e6e9; --dim: #9a9ea6; --accent: #7aa2f7; --accent2: #9ece6a;
+    --danger: #f7768e; --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 "Microsoft YaHei", system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; font-weight: 600; }
+  .badge { font-size: 12px; color: var(--dim); background: var(--panel2); border: 1px solid var(--line); padding: 2px 10px; border-radius: 99px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); }
+  .dot.off { background: var(--danger); }
+  nav { display: flex; gap: 4px; margin-left: auto; }
+  nav button { background: none; border: none; color: var(--dim); padding: 6px 14px; font-size: 14px; cursor: pointer; border-radius: 8px; }
+  nav button.on { color: var(--text); background: var(--panel2); }
+  main { flex: 1; overflow: hidden; display: flex; }
+  .tab { display: none; flex: 1; flex-direction: column; overflow: hidden; }
+  .tab.on { display: flex; }
+
+  /* 对话 */
+  #chatlog { flex: 1; overflow-y: auto; padding: 18px 10%; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 78%; padding: 9px 14px; border-radius: var(--radius); white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: #314060; }
+  .msg.ai { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
+  .msg.meta { align-self: center; color: var(--dim); font-size: 12px; background: none; }
+  #chatbar { display: flex; gap: 8px; padding: 12px 10%; background: var(--panel); border-top: 1px solid var(--line); }
+  #chatbar input { flex: 1; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; color: var(--text); font-size: 14px; outline: none; }
+  #chatbar input:focus { border-color: var(--accent); }
+  button.primary { background: var(--accent); border: none; color: #10131a; font-weight: 600; padding: 9px 18px; border-radius: 8px; cursor: pointer; }
+  button.primary:disabled { opacity: .5; cursor: wait; }
+
+  /* 记忆 */
+  .pane { flex: 1; overflow-y: auto; padding: 18px 10%; display: flex; flex-direction: column; gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+  .card h3 { font-size: 13px; color: var(--dim); font-weight: 500; margin-bottom: 10px; }
+  .card textarea { width: 100%; min-height: 64px; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; color: var(--text); padding: 9px 12px; font: inherit; resize: vertical; outline: none; }
+  .card textarea:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  select, .card input[type=text] { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; color: var(--text); padding: 7px 10px; font: inherit; outline: none; }
+  .card input[type=text]:focus, select:focus { border-color: var(--accent); }
+  button.ghost { background: none; border: 1px solid var(--line); color: var(--dim); padding: 7px 14px; border-radius: 8px; cursor: pointer; }
+  button.ghost:hover { color: var(--text); border-color: var(--accent); }
+  button.del { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 12px; padding: 4px 8px; }
+  .mem { display: flex; align-items: center; gap: 10px; padding: 9px 4px; border-top: 1px solid var(--line); }
+  .mem:first-child { border-top: none; }
+  .mem .name { font-weight: 600; }
+  .mem .desc { color: var(--dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip { font-size: 11px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--dim); flex-shrink: 0; }
+  .chip.user { color: #7aa2f7; } .chip.feedback { color: #e0af68; } .chip.project { color: #9ece6a; } .chip.reference { color: #bb9af7; }
+  .mem .date { color: var(--dim); font-size: 12px; flex-shrink: 0; }
+
+  /* 配置 */
+  .cfg { display: flex; flex-direction: column; gap: 10px; }
+  .cfg label { font-size: 12px; color: var(--dim); display: block; margin-bottom: 4px; }
+  .cfg input { width: 100%; }
+  .presets { display: flex; gap: 6px; flex-wrap: wrap; }
+  .presets button { font-size: 12px; }
+  #cfgmsg { color: var(--accent2); font-size: 13px; min-height: 18px; }
+  .status { font-size: 12px; color: var(--dim); }
+
+  #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--accent); color: var(--text); padding: 8px 18px; border-radius: 99px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>记忆Harness</h1>
+  <span class="badge" id="modelbadge">…</span>
+  <span class="badge" id="memcount">…</span>
+  <nav>
+    <button data-tab="chat" class="on">对话</button>
+    <button data-tab="mem">记忆</button>
+    <button data-tab="cfg">配置</button>
+  </nav>
+</header>
+
+<main>
+  <section class="tab on" id="tab-chat">
+    <div id="chatlog"></div>
+    <div id="chatbar">
+      <input id="msg" placeholder="输入消息，Enter 发送（回答会结合本地记忆）" autofocus>
+      <button class="primary" id="send">发送</button>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-mem">
+    <div class="pane">
+      <div class="card">
+        <h3>新增记忆（保存时由模型起名、写摘要、归类）</h3>
+        <textarea id="newmem" placeholder="要记住的内容…"></textarea>
+        <div class="row">
+          <select id="newmemtype">
+            <option value="">类型：自动</option>
+            <option value="user">user（用户偏好）</option>
+            <option value="feedback">feedback（对助手的要求）</option>
+            <option value="project">project（项目/进行中事务）</option>
+            <option value="reference">reference（外部资源链接）</option>
+          </select>
+          <button class="primary" id="savemem">保存</button>
+        </div>
+      </div>
+      <div class="card" style="flex:1">
+        <div class="row" style="margin:0 0 10px">
+          <h3 style="flex:1;margin:0">全部记忆</h3>
+          <button class="ghost" id="importbtn">导入 .txt / .md</button>
+          <input type="file" id="importfile" multiple accept=".txt,.md,.markdown" style="display:none">
+          <input type="text" id="memsearch" placeholder="关键词过滤…" style="width:200px">
+        </div>
+        <div id="memlist"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-cfg">
+    <div class="pane">
+      <div class="card cfg">
+        <h3>模型后端（OpenAI 兼容 /chat/completions）</h3>
+        <div class="presets">
+          <button class="ghost" data-bu="https://open.bigmodel.cn/api/paas/v4" data-m="glm-4-flash">智谱 GLM</button>
+          <button class="ghost" data-bu="https://api.deepseek.com/v1" data-m="deepseek-chat">DeepSeek</button>
+          <button class="ghost" data-bu="https://api.moonshot.cn/v1" data-m="moonshot-v1-8k">Kimi</button>
+          <button class="ghost" data-bu="https://dashscope.aliyuncs.com/compatible-mode/v1" data-m="qwen-plus">通义千问</button>
+          <button class="ghost" data-bu="http://127.0.0.1:11434/v1" data-m="qwen2.5:7b">Ollama 本机</button>
+          <button class="ghost" data-bu="http://127.0.0.1:1234/v1" data-m="">LM Studio 本机</button>
+        </div>
+        <div><label>接口地址 base_url</label><input type="text" id="cfg_base_url"></div>
+        <div><label>模型 model</label><input type="text" id="cfg_model"></div>
+        <div><label>API Key（本地服务可留空；已设置时不回显，留空=不修改）</label><input type="password" id="cfg_api_key" placeholder=""></div>
+        <div><label>记忆目录 memory_dir</label><input type="text" id="cfg_memory_dir"></div>
+        <div class="row">
+          <button class="primary" id="savecfg">保存配置</button>
+          <span id="cfgmsg"></span>
+        </div>
+        <div class="status" id="cfgstatus"></div>
+      </div>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let state = null, history = [];
+
+async function api(path, body) {
+  const opt = body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {};
+  const j = await (await fetch(path, opt)).json();
+  if (j.error) throw new Error(j.error);
+  return j;
+}
+function toast(t) { const el = $('#toast'); el.textContent = t; el.style.display = 'block'; clearTimeout(el._t); el._t = setTimeout(() => el.style.display = 'none', 2200); }
+
+function renderAll() {
+  $('#modelbadge').textContent = state.model + ' @ ' + state.base_url;
+  $('#memcount').textContent = '记忆 ' + state.memories.length + ' 条';
+  $('#dot').className = 'dot' + ((state.is_local || state.has_key) ? '' : ' off');
+  $('#cfg_base_url').value = state.base_url;
+  $('#cfg_model').value = state.model;
+  $('#cfg_memory_dir').value = state.memory_dir;
+  $('#cfgstatus').textContent = '当前：' + state.model + '  ·  ' +
+    (state.is_local ? '本地服务（免 Key）' : (state.has_key ? '云端（Key 已设置）' : '⚠ 云端但未设置 Key'));
+  renderMemories();
+}
+
+/* ---------- 对话 ---------- */
+function addMsg(cls, text) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + cls;
+  el.textContent = text;
+  $('#chatlog').appendChild(el);
+  $('#chatlog').scrollTop = 1e9;
+  return el;
+}
+async function send() {
+  const box = $('#msg'), text = box.value.trim(), btn = $('#send');
+  if (!text) return;
+  box.value = ''; btn.disabled = true;
+  addMsg('user', text);
+  history.push({role: 'user', content: text});
+  const pend = addMsg('ai', '…');
+  try {
+    const j = await api('/api/chat', {message: text, history: history.slice(0, -1)});
+    pend.textContent = j.reply;
+    history.push({role: 'assistant', content: j.reply});
+  } catch (e) {
+    pend.textContent = '⚠ 调用失败：' + e.message;
+    history.pop();
+  }
+  btn.disabled = false; box.focus();
+}
+$('#send').onclick = send;
+$('#msg').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+
+/* ---------- 记忆 ---------- */
+function renderMemories() {
+  const q = $('#memsearch').value.trim().toLowerCase(), list = $('#memlist');
+  list.innerHTML = '';
+  state.memories
+    .filter(m => !q || (m.name + ' ' + m.description + ' ' + m.type).toLowerCase().includes(q))
+    .forEach(m => {
+      const row = document.createElement('div');
+      row.className = 'mem';
+      row.innerHTML = '<span class="chip ' + m.type + '">' + m.type + '</span>' +
+        '<span class="name">' + m.name + '</span>' +
+        '<span class="desc" title="' + m.description.replace(/"/g, '&quot;') + '">' + m.description + '</span>' +
+        '<span class="date">' + m.created + '</span>';
+      const del = document.createElement('button');
+      del.className = 'del'; del.textContent = '删除';
+      del.onclick = async () => {
+        if (!confirm('删除记忆「' + m.name + '」？')) return;
+        try { await api('/api/delete', {name: m.name}); state = await api('/api/state'); renderAll(); toast('已删除 ' + m.name); }
+        catch (e) { toast('删除失败：' + e.message); }
+      };
+      row.appendChild(del);
+      list.appendChild(row);
+    });
+  if (!list.children.length) list.innerHTML = '<div class="status">（无匹配）</div>';
+}
+$('#memsearch').addEventListener('input', renderMemories);
+$('#savemem').onclick = async () => {
+  const text = $('#newmem').value.trim();
+  if (!text) return toast('内容为空');
+  try {
+    const j = await api('/api/save', {text, type: $('#newmemtype').value || null});
+    $('#newmem').value = '';
+    state = await api('/api/state'); renderAll();
+    toast('已保存：' + j.name);
+  } catch (e) { toast('保存失败：' + e.message); }
+};
+
+/* ---------- 导入 .txt / .md ---------- */
+async function readSmart(file) {
+  const buf = await file.arrayBuffer();
+  try { return new TextDecoder('utf-8', {fatal: true}).decode(buf); }
+  catch (e) { return new TextDecoder('gbk').decode(buf); }  // Windows 记事本 GBK 兜底
+}
+$('#importbtn').onclick = () => $('#importfile').click();
+$('#importfile').onchange = async e => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (!files.length) return;
+  const type = $('#newmemtype').value || null;
+  let ok = 0;
+  for (const f of files) {
+    try {
+      const content = await readSmart(f);
+      const j = await api('/api/import', {filename: f.name, content, type});
+      toast('已导入 ' + f.name + ' → ' + j.name);
+      ok++;
+    } catch (err) { toast('导入 ' + f.name + ' 失败：' + err.message); }
+  }
+  state = await api('/api/state'); renderAll();
+};
+
+/* ---------- 配置 ---------- */
+document.querySelectorAll('.presets button').forEach(b => b.onclick = () => {
+  $('#cfg_base_url').value = b.dataset.bu;
+  if (b.dataset.m) $('#cfg_model').value = b.dataset.m;
+});
+$('#savecfg').onclick = async () => {
+  try {
+    for (const k of ['base_url', 'model', 'memory_dir'])
+      ({state} = await api('/api/config', {key: k, value: $('#' + 'cfg_' + k).value}));
+    const ak = $('#cfg_api_key').value.trim();
+    if (ak) ({state} = await api('/api/config', {key: 'api_key', value: ak}));
+    $('#cfg_api_key').value = '';
+    $('#cfgmsg').textContent = '✓ 已保存并生效';
+    setTimeout(() => $('#cfgmsg').textContent = '', 3000);
+    renderAll();
+  } catch (e) { $('#cfgmsg').textContent = '✗ ' + e.message; }
+};
+
+/* ---------- 标签页 ---------- */
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.id === 'tab-' + b.dataset.tab));
+  if (b.dataset.tab === 'chat') $('#msg').focus();
+});
+
+refresh = async () => { try { state = await api('/api/state'); renderAll(); } catch (e) { $('#modelbadge').textContent = '服务未连接'; $('#dot').className = 'dot off'; } };
+addMsg('meta', '回答会结合本地记忆；此页刷新后对话清空，记忆永久保留。');
+refresh();
+</script>
+</body>
+</html>
