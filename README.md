@@ -175,10 +175,23 @@ created: 2026-11-18
 - 每次问答后检查历史总字符数，超过 `history_budget`（默认 8000）就把**除最近 4 条以外**的部分：
   1. 原文写入 `journal/c1.md`（逐块递增，不覆盖）；
   2. 让模型压成 3 行以内的要点（保留结论、决定及理由、路径/命令/数字），失败则退化为"保留头 70% + 尾 30% 字符"的本地摘要；
-  3. 摘要以 `- [c1] …` 的形式追加到 `summary`，拼进 system prompt；
+  3. 摘要以 `- [c1] …` 的形式追加到 `summary`，拼进 system prompt，并**原子写进 `journal/.summary.md`**；
 - 摘要里的块号永远指向真实文件：`python harness.py log show c1` 能看回原文。**摘要是有损的，但原文没丢。**
 
-网页端把 `history` / `summary` / `blocks` 放在浏览器里来回传，所以刷新之前上下文不会丢；服务端每次都做同样的压缩判断。
+网页端把 `history` / `summary` / `blocks` 放在浏览器里来回传，所以刷新之前上下文不会丢；服务端每次都做同样的压缩判断。浏览器刷新或换台设备打开时，`history` 是空的，服务端会把磁盘里的 `journal/.summary.md` 和已有块号捡回来（`ChatSession.from_state`），接着上次的摘要往下聊——压缩过的内容不会因为关了网页就白压。
+
+## 什么会自动落盘，什么要你动手
+
+| 东西 | 位置 | 谁触发 |
+| --- | --- | --- |
+| 被压缩的对话原文 | `journal/c1.md`、`c2.md`… | **自动**（历史超 `history_budget` 就压） |
+| 压缩摘要索引 | `journal/.summary.md` | **自动**（每次压缩后原子写；重开会话自动读回） |
+| 图片 | `journal/images/<时间>-<随机>.png` | **自动**（发图时落盘，md 里只留路径） |
+| 检索索引 | `memories/.index.json` | **自动**（惰性重建：记忆文件变了、或签名对不上就重扫） |
+| 记忆条目 | `memories/<名字>.md` | **手动**：`save`、命令行 `/save`、网页端「存记忆」 |
+| 记忆总览 | `memories/MEMORY.md` | **自动**（增删记忆时重建，只给人看） |
+
+也就是说：**聊天本身写的是 `journal/`，记忆库 `memories/` 写不写由你决定**。想让某句话进长期记忆，就 `save` 一下；不存也照样能聊，只是它只活在 `journal/` 的压缩块里。
 
 ## 配置
 
@@ -231,7 +244,7 @@ created: 2026-11-18
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 32 个用例，不联网
+python -m unittest discover -s tests -v     # 35 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 

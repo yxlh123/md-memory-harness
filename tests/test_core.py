@@ -191,6 +191,33 @@ class TestChatCompaction(unittest.TestCase):
         s3 = harness.ChatSession(budget=50, keep_recent=2)
         self.assertEqual(s3.blocks, ["c1"])
 
+    def test_summary_index_is_written_to_disk(self):
+        """压完必须有一份摘要落在 journal/.summary.md，不能只活在内存/浏览器里。"""
+        s = harness.ChatSession(budget=50, keep_recent=2)
+        s.messages = [{"role": "user", "content": "第%d轮 " % i + "内容" * 20} for i in range(6)]
+        s.compact_if_needed()
+        path = os.path.join(harness.JOURNAL_DIR, ".summary.md")
+        self.assertTrue(os.path.isfile(path), "摘要索引没落盘")
+        text = open(path, encoding="utf-8").read()
+        self.assertIn("[c1]", text)
+        self.assertEqual(harness.load_summary(), text)
+
+    def test_summary_comes_back_after_page_reload(self):
+        """浏览器刷新后 history 是空的：摘要和块号要从磁盘捡回来。"""
+        s = harness.ChatSession(budget=50, keep_recent=2)
+        s.messages = [{"role": "user", "content": "第%d轮 " % i + "内容" * 20} for i in range(6)]
+        s.compact_if_needed()
+
+        fresh = harness.ChatSession.from_state([], "", [])      # 等价于刚打开的网页
+        self.assertIn("[c1]", fresh.summary)
+        self.assertEqual(fresh.blocks, ["c1"])
+
+    def test_summary_file_not_listed_as_block(self):
+        s = harness.ChatSession(budget=50, keep_recent=2)
+        s.messages = [{"role": "user", "content": "第%d轮 " % i + "内容" * 20} for i in range(6)]
+        s.compact_if_needed()
+        self.assertEqual(harness.list_journal(), ["c1"], ".summary.md 不能被当成对话块")
+
 
 PNG_1PX = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlE"
            "QVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")

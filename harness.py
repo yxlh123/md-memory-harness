@@ -34,7 +34,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -577,8 +577,31 @@ def _journal_write(block, text):
 def list_journal():
     if not os.path.isdir(JOURNAL_DIR):
         return []
-    return sorted((os.path.splitext(f)[0] for f in os.listdir(JOURNAL_DIR) if f.endswith(".md")),
+    return sorted((os.path.splitext(f)[0] for f in os.listdir(JOURNAL_DIR)
+                   if f.endswith(".md") and not f.startswith(".")),
                   key=lambda s: (len(s), s))
+
+
+SUMMARY_FILE = ".summary.md"
+
+
+def summary_path():
+    return os.path.join(JOURNAL_DIR, SUMMARY_FILE)
+
+
+def load_summary():
+    """读回磁盘上的压缩摘要；没有就是空串。"""
+    p = summary_path()
+    if not os.path.isfile(p):
+        return ""
+    text = _read_text_file(p)
+    return text if (not text or text.endswith("\n")) else text + "\n"
+
+
+def save_summary(text):
+    """把整份摘要原子写进 journal/.summary.md —— 关掉网页也不丢。"""
+    os.makedirs(JOURNAL_DIR, exist_ok=True)
+    _atomic_write(summary_path(), text)
 
 
 # ---------- 图片（多模态输入） ----------
@@ -696,6 +719,9 @@ class ChatSession:
         s = cls(summary=summary, blocks=blocks)
         s.messages = [m for m in (messages or [])
                       if m.get("role") in ("user", "assistant") and m.get("content")]
+        if not s.messages and not s.summary:
+            # 网页刚打开 / 刷新过头：把磁盘上的摘要捡回来，不让之前的压缩白压
+            s.summary = load_summary()
         return s
 
     def state(self):
@@ -723,6 +749,7 @@ class ChatSession:
         _journal_write(block, text)
         self.blocks.append(block)
         self.summary += f"- [{block}] {summarize_text(text)}\n"
+        save_summary(self.summary)          # 摘要落盘：网页关了、进程重启了都能捡回来
         return True
 
     # -- 提问 --
@@ -852,6 +879,8 @@ def cmd_ask(a):
 def cmd_chat(a):
     idx = load_index()
     sess = ChatSession(budget=a.budget)
+    if not sess.summary:                 # 上次聊完压过的摘要，接着用
+        sess.summary = load_summary()
     pending = [file_to_data_url(p) for p in (getattr(a, "image", None) or [])]
     print(f"md-memory-harness {VERSION} 对话模式")
     print(f"模型 {MODEL} @ {BASE_URL} | 记忆 {len(idx['entries'])} 条 | "

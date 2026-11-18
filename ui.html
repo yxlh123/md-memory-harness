@@ -372,8 +372,18 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   if (b.dataset.tab === 'chat') $('#msg').focus();
 });
 
-refresh = async () => { try { state = await api('/api/state'); renderAll(); } catch (e) { $('#modelbadge').textContent = '服务未连接'; $('#dot').className = 'dot off'; } };
-addMsg('meta', '回答会结合本地记忆；此页刷新后对话清空，记忆永久保留。');
+refresh = async () => {
+  try {
+    state = await api('/api/state');
+    // 页面刚打开/刷新过：把磁盘上的压缩摘要和块号接回来，不然之前的压缩白压了
+    if (!history.length && state.blocks && state.blocks.length) {
+      summary = state.summary || '';
+      blocks = state.blocks;
+    }
+    renderAll();
+  } catch (e) { $('#modelbadge').textContent = '服务未连接'; $('#dot').className = 'dot off'; }
+};
+addMsg('meta', '回答会结合本地记忆；对话超预算会自动压成摘要存进 journal/，此页刷新后对话清空、摘要与记忆保留。');
 refresh();
 </script>
 </body>

@@ -87,6 +87,8 @@ def api_state():
                       "created": m.get("created", "")}
                      for n, m, _, _ in harness.read_all()],
         "indexed": len(idx["entries"]),
+        "summary": harness.load_summary(),     # 磁盘上的压缩摘要，页面刷新后能接上
+        "blocks": harness.list_journal(),
     }
 
 
