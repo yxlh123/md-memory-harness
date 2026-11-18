@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.test-tmp/
+journal/
+config.json
+memories/.index.json
+memories/.trash/
+.venv/

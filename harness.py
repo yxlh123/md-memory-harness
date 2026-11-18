@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""本地 Markdown 记忆 harness。
+"""md-memory-harness — 本地 Markdown 记忆 + 分层检索 + 对话摘要压缩。
 
-记忆以 .md 文件存本地（memories/ 目录 + MEMORY.md 索引），
-"理解/加工"类步骤（起名、摘要、对话、问答）通过 LLM API 完成。
-
-用法示例：
-  python harness.py save 用户偏好深色主题 --type user
-  python harness.py list
-  python harness.py search 深色
-  python harness.py show user-preference-dark-theme
-  python harness.py ask 用户有什么偏好？
-  python harness.py chat          # 连续对话模式
-  python harness.py config        # 查看/设置配置（写入 config.json）
-  python harness.py delete user-preference-dark-theme
-  python harness.py rebuild
+三层结构：
+  1) 存储层：一条记忆一个 .md（frontmatter + 正文）。
+     - 原子写（先写临时文件再改名），不会因中断留下半个文件；
+     - 软删除（移到 .trash/），删错还能捞回来；
+     - 定位条目时同时认「文件名」和「frontmatter 里的 name」。
+  2) 检索层：中文按二元组（bigram）切分建索引，按命中率排序，三级回退：
+       digest  —— 命中明确：只给摘要 + 开头一段正文；
+       snippet —— 命中偏弱：摘要 + 命中词附近的原文片段；
+       recent  —— 完全没命中：只给最近 N 条，明确标注并限量（绝不全量硬塞）。
+  3) 对话层：历史超预算时，把较早的对话压成摘要，原文落盘到 journal/，
+     摘要里带块号（c1、c2…），需要时 `python harness.py log show c1` 回读全文。
 
 配置优先级：环境变量 > config.json > 内置默认。
   MEMORY_DIR / MEMORY_LLM_BASE_URL / MEMORY_LLM_API_KEY / MEMORY_LLM_MODEL
-  config.json 可用 config set 写入：base_url / api_key / model / memory_dir
-  本地服务（Ollama、LM Studio 等）无需 api_key。
 """
 import argparse
 import datetime
@@ -32,9 +28,11 @@ import urllib.request
 
 try:  # Windows 控制台默认 GBK，避免打印中文报错
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
+VERSION = "2.0.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -43,6 +41,8 @@ _DEFAULTS = {
     "api_key": "",
     "model": "glm-4-flash",
     "memory_dir": "",
+    "retrieve_budget": "6000",   # 每次带进 prompt 的记忆字符数上限
+    "history_budget": "8000",    # 对话历史字符数上限，超了就把旧对话压成摘要
 }
 _ENV_KEYS = {
     "base_url": "MEMORY_LLM_BASE_URL",
@@ -72,26 +72,46 @@ BASE_URL = CFG["base_url"].rstrip("/")
 API_KEY = CFG["api_key"] or os.environ.get("ZHIPUAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
 MODEL = CFG["model"]
 MEM_DIR = CFG["memory_dir"] or os.path.join(ROOT, "memories")
-INDEX_FILE = os.path.join(MEM_DIR, "MEMORY.md")
+INDEX_FILE = os.path.join(MEM_DIR, "MEMORY.md")      # 给人看的索引
+IDX_FILE = os.path.join(MEM_DIR, ".index.json")      # 给程序用的索引
+TRASH_DIR = os.path.join(MEM_DIR, ".trash")
+JOURNAL_DIR = os.path.join(ROOT, "journal")          # 对话原文（摘要里的块号指向这里）
 
 TYPES = ("user", "feedback", "project", "reference")
 MEM_EXTS = (".md", ".markdown", ".txt")
 FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.S)
-
-
-def memory_path(name):
-    """按 .md/.markdown/.txt 顺序定位记忆文件，找不到返回 None。"""
-    for ext in MEM_EXTS:
-        p = os.path.join(MEM_DIR, name + ext)
-        if os.path.isfile(p):
-            return p
-    return None
+CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 
 CHAT_SYS = ("你是基于本地 Markdown 记忆库的对话助手。回答尽量结合给出的记忆，"
             "记忆里没有的就直说，不要编造。回答保持简洁。")
+ASK_SYS = ("你是基于本地记忆的问答助手。只依据给出的记忆回答，记忆里没有的就直说，"
+           "不要编造。回答末尾列出用到的记忆 name。")
 
 
-# ---------- 本地存储 ----------
+# ---------- 存储层 ----------
+
+def _atomic_write(path, text):
+    """原子写：写临时文件 → fsync → 改名覆盖。中途断电不会留下半个文件。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _read_text_file(path):
+    """读 txt/md：先按 UTF-8（含 BOM），失败回退 GBK 系（Windows 记事本默认编码）。"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
 
 def parse_memory(text):
     """拆出 frontmatter 字典和正文。"""
@@ -106,25 +126,61 @@ def parse_memory(text):
     return meta, body.strip()
 
 
-def read_all():
-    """读取全部记忆（.md/.markdown/.txt），返回 [(name, meta, body, path)]，按创建日期排序。"""
-    items = []
+def _memory_files():
+    """memories/ 下所有记忆文件（跳过索引文件与隐藏文件）。"""
+    out = []
     if os.path.isdir(MEM_DIR):
         for fn in sorted(os.listdir(MEM_DIR)):
-            stem, ext = os.path.splitext(fn)
+            _, ext = os.path.splitext(fn)
             if ext.lower() not in MEM_EXTS or fn == "MEMORY.md" or fn.startswith("."):
                 continue
-            path = os.path.join(MEM_DIR, fn)
-            meta, body = parse_memory(_read_text_file(path))
-            if ext.lower() != ".md" and not meta:
-                # 手动放入的 txt：合成基础元数据（首行当描述，类型标记为 txt）
-                first = next((l.strip() for l in body.splitlines() if l.strip()), stem)
-                meta = {"name": stem, "description": first[:60],
-                        "type": "txt", "created": datetime.date.today().isoformat()}
-            meta["_file"] = fn
-            items.append((stem, meta, body, path))
+            out.append(fn)
+    return out
+
+
+def read_all():
+    """读取全部记忆，返回 [(stem, meta, body, path)]，按创建日期排序。"""
+    items = []
+    for fn in _memory_files():
+        stem, ext = os.path.splitext(fn)
+        path = os.path.join(MEM_DIR, fn)
+        meta, body = parse_memory(_read_text_file(path))
+        if ext.lower() != ".md" and not meta:
+            # 手动放入的 txt：合成基础元数据（首行当描述，类型标记为 txt）
+            first = next((l.strip() for l in body.splitlines() if l.strip()), stem)
+            meta = {"name": stem, "description": first[:60],
+                    "type": "txt", "created": datetime.date.today().isoformat()}
+        meta["_file"] = fn
+        items.append((stem, meta, body, path))
     items.sort(key=lambda x: x[1].get("created", ""))
     return items
+
+
+def memory_path(name):
+    """按 .md/.markdown/.txt 顺序定位记忆文件，找不到返回 None。"""
+    for ext in MEM_EXTS:
+        p = os.path.join(MEM_DIR, name + ext)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def find_memory(name):
+    """定位一条记忆：先按文件名，再按 frontmatter 里的 name（修掉导入后对不上的问题）。
+
+    返回 (file_stem, meta, body, path) 或 None。
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    p = memory_path(name)
+    if p:
+        meta, body = parse_memory(_read_text_file(p))
+        return os.path.splitext(os.path.basename(p))[0], meta, body, p
+    for stem, meta, body, p in read_all():
+        if name in (stem, meta.get("name", "")):
+            return stem, meta, body, p
+    return None
 
 
 def slugify(text):
@@ -134,10 +190,15 @@ def slugify(text):
 
 def unique_name(name):
     base, i = name, 2
-    while memory_path(base):
+    while find_memory(base):
         base = f"{name}-{i}"
         i += 1
     return base
+
+
+def _one_line(text, limit=200):
+    """把模型输出压成一行（frontmatter 里不能有换行）。"""
+    return " ".join(str(text).split())[:limit]
 
 
 def save_memory(name, description, mtype, body):
@@ -146,23 +207,230 @@ def save_memory(name, description, mtype, body):
     path = os.path.join(MEM_DIR, name + ".md")
     front = ("---\n"
              f"name: {name}\n"
-             f"description: {description}\n"
+             f"description: {_one_line(description, 200)}\n"
              f"type: {mtype}\n"
              f"created: {datetime.date.today().isoformat()}\n"
              "---\n\n")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(front + body.strip() + "\n")
+    _atomic_write(path, front + body.strip() + "\n")
+    rebuild_index()
     return name, path
 
 
-def rebuild_index(items=None):
+def delete_memory(name, purge=False):
+    """软删除：移到 .trash/；purge=True 时直接删掉。返回移走后的路径。"""
+    found = find_memory(name)
+    if not found:
+        raise FileNotFoundError(f"找不到记忆 {name}")
+    _, _, _, path = found
+    if purge:
+        os.remove(path)
+        rebuild_index()
+        return path
+    os.makedirs(TRASH_DIR, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = os.path.join(TRASH_DIR, f"{stamp}-{os.path.basename(path)}")
+    os.replace(path, target)
+    rebuild_index()
+    return target
+
+
+def rebuild_index():
+    """重建 MEMORY.md（给人看的索引）。机器索引见 build_index()。"""
+    rebuild_md_index()
+
+
+def rebuild_md_index(items=None):
     items = items if items is not None else read_all()
-    lines = ["# 记忆索引", ""]
-    lines += [f"- [{m.get('name', n)}]({m.get('_file', n + '.md')}) — {m.get('description', '(无描述)')}"
-              for n, m, _, _ in items]
+    lines = ["# 记忆索引", "",
+             f"共 {len(items)} 条。本文件由 `python harness.py rebuild` 自动生成，手改会被覆盖。", ""]
+    for n, m, _, _ in items:
+        lines.append(f"- [{m.get('name', n)}]({m.get('_file', n + '.md')})"
+                     f" — {m.get('description', '(无描述)')}")
     os.makedirs(MEM_DIR, exist_ok=True)
-    with open(INDEX_FILE, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    _atomic_write(INDEX_FILE, "\n".join(lines) + "\n")
+
+
+# ---------- 检索层 ----------
+
+def tokenize(text):
+    """粗分词：英文/数字按词，中文按二元组（bigram）。够本地几百条记忆用。"""
+    t = (text or "").lower()
+    toks = set()
+    for w in re.findall(r"[a-z0-9][a-z0-9_\-\.]*", t):
+        if len(w) >= 2:
+            toks.add(w)
+    for run in re.findall(f"[{CJK}]+", t):
+        if len(run) == 1:
+            toks.add(run)
+        else:
+            toks.update(run[i:i + 2] for i in range(len(run) - 1))
+    return toks
+
+
+def _signature():
+    """磁盘快照，用来判断索引是否过期。"""
+    sig = []
+    for fn in _memory_files():
+        p = os.path.join(MEM_DIR, fn)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        sig.append([fn, int(st.st_mtime), st.st_size])
+    return sig
+
+
+def build_index():
+    """重建机器索引（.index.json）。"""
+    sig = _signature()
+    entries = []
+    for stem, meta, body, path in read_all():
+        head = f"{meta.get('name', stem)} {meta.get('description', '')}"
+        entries.append({
+            "file": meta.get("_file", stem + ".md"),
+            "name": meta.get("name", stem),
+            "description": meta.get("description", ""),
+            "type": meta.get("type", "?"),
+            "created": meta.get("created", ""),
+            "head_tokens": sorted(tokenize(head)),
+            "tokens": sorted(tokenize(body)),
+        })
+    idx = {"version": 2, "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+           "signature": sig, "entries": entries}
+    os.makedirs(MEM_DIR, exist_ok=True)
+    _atomic_write(IDX_FILE, json.dumps(idx, ensure_ascii=False, indent=1))
+    return idx
+
+
+def load_index(force=False):
+    """读索引；过期或不存在就重建。"""
+    if not force and os.path.exists(IDX_FILE):
+        try:
+            with open(IDX_FILE, encoding="utf-8") as f:
+                idx = json.load(f)
+            if idx.get("version") == 2 and idx.get("signature") == _signature():
+                return idx
+        except Exception:
+            pass
+    return build_index()
+
+
+def rank_entries(question, idx=None):
+    """按命中率排序，返回 [(score, entry)]，只保留有命中的。"""
+    idx = idx or load_index()
+    q = tokenize(question)
+    if not q:
+        return []
+    phrase = (question or "").strip().lower()
+    out = []
+    for e in idx["entries"]:
+        body = set(e.get("tokens") or [])
+        head = set(e.get("head_tokens") or [])
+        hit = q & (body | head)   # 名字/描述也要能命中，不能只搜正文
+        if not hit:
+            continue
+        score = len(hit) / len(q)
+        if q & head:
+            score += 0.5 * len(q & head) / len(q)
+        if phrase and phrase in (e.get("name", "") + e.get("description", "")).lower():
+            score += 0.5
+        out.append((round(min(score, 1.5), 3), e))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+def _entry_body(entry):
+    p = os.path.join(MEM_DIR, entry.get("file", ""))
+    if os.path.isfile(p):
+        return parse_memory(_read_text_file(p))[1]
+    return ""
+
+
+def _digest(entry, limit=400):
+    body = _entry_body(entry)
+    snippet = body[:limit] + ("…" if len(body) > limit else "")
+    return (f"### {entry['name']}  [{entry.get('type', '?')}] {entry.get('description', '')}\n"
+            f"{snippet}")
+
+
+def _snippet(entry, question, limit=600):
+    """摘要 + 命中词附近的原文片段。"""
+    q = tokenize(question)
+    lines = []
+    for line in _entry_body(entry).splitlines():
+        if tokenize(line) & q:
+            lines.append(line.strip()[:160])
+        if len(lines) >= 6:
+            break
+    body = "\n".join("  " + l for l in lines) if lines else _entry_body(entry)[:limit]
+    return (f"### {entry['name']}  [{entry.get('type', '?')}] {entry.get('description', '')}\n"
+            f"{body[:limit]}")
+
+
+def retrieve(question, budget_chars=None):
+    """三级回退检索，返回 {text, tier, names, count}。
+
+    digest：命中明确 → 摘要 + 开头正文
+    snippet：命中偏弱 → 摘要 + 命中处片段
+    recent：没命中 → 最近 N 条，明确标注并限量
+    """
+    budget_chars = budget_chars or int(CFG.get("retrieve_budget") or 6000)
+    idx = load_index()
+    if not idx["entries"]:
+        return {"text": "", "tier": "empty", "names": [], "count": 0}
+
+    ranked = rank_entries(question, idx)
+    if ranked and ranked[0][0] >= 0.5:
+        tier, picked = "digest", [e for _, e in ranked[:6]]
+        render = lambda e: _digest(e)  # noqa: E731
+    elif ranked:
+        tier, picked = "snippet", [e for _, e in ranked[:6]]
+        render = lambda e: _snippet(e, question)  # noqa: E731
+    else:
+        tier = "recent"
+        picked = idx["entries"][-8:]
+        render = lambda e: _digest(e)  # noqa: E731
+
+    parts, used = [], 0
+    for e in picked:
+        chunk = render(e)
+        if used + len(chunk) > budget_chars:
+            break
+        parts.append(chunk)
+        used += len(chunk)
+
+    header = {
+        "digest": "",
+        "snippet": "（以下是按关键词匹配到的片段，未匹配到的记忆本次未带入）\n",
+        "recent": "（没有检索到直接相关的记忆，以下是最近的几条，仅供参考）\n",
+    }[tier]
+    text = header + "\n\n".join(parts) if parts else ""
+    return {"text": text, "tier": tier, "names": [e["name"] for e in picked[:len(parts)]],
+            "count": len(parts)}
+
+
+def memory_corpus(question, max_items=6, budget=30000):
+    """兼容旧接口：返回 (语料, 条数)。"""
+    r = retrieve(question, budget_chars=min(int(CFG.get("retrieve_budget") or 6000), budget))
+    return r["text"], r["count"]
+
+
+def print_search(query):
+    """有索引的搜索：按命中率排序，打印命中的行。"""
+    idx = load_index()
+    ranked = rank_entries(query, idx)
+    if not ranked:
+        print("（本地没有匹配；也可以直接问模型：python harness.py ask …）")
+        return
+    qt = tokenize(query)
+    for score, e in ranked[:10]:
+        print(f"[{score:.2f}] {e['name']}  ({e.get('type', '?')}, {e.get('created', '?')})")
+        print(f"       {e.get('description', '')}")
+        for line in _entry_body(e).splitlines():
+            if tokenize(line) & qt:
+                print(f"       > {line.strip()[:100]}")
+                break
+    print(f"\n命中 {len(ranked)} 条，索引：{IDX_FILE}")
 
 
 # ---------- LLM 调用 ----------
@@ -188,7 +456,7 @@ def llm(messages, temperature=0.3):
                          "temperature": temperature}).encode("utf-8"),
         headers=headers,
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
+    with urllib.request.urlopen(req, timeout=180) as r:
         data = json.loads(r.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"]
 
@@ -202,7 +470,7 @@ def extract_json(text):
 
 def smart_meta(text):
     """让 LLM 为新记忆生成 name / description / type。"""
-    names = ", ".join(m.get("name", n) for n, m, _, _ in read_all()) or "（暂无）"
+    names = ", ".join(m.get("name", n) for n, m, _, _ in read_all()[:200]) or "（暂无）"
     out = llm([
         {"role": "system", "content": "你负责整理个人记忆条目，只输出一个 JSON 对象，不要输出其它文字。"},
         {"role": "user", "content": (
@@ -217,24 +485,108 @@ def smart_meta(text):
     return meta.get("name", ""), meta.get("description", text[:40]), meta.get("type", "project")
 
 
+# ---------- 对话层：超预算就摘要，原文留档 ----------
+
+def _journal_path(block):
+    return os.path.join(JOURNAL_DIR, f"{block}.md")
+
+
+def _journal_write(block, text):
+    os.makedirs(JOURNAL_DIR, exist_ok=True)
+    head = (f"# 对话原文 #{block}\n\n"
+            f"> 生成于 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}，"
+            f"被压缩进摘要的原始对话。\n\n")
+    _atomic_write(_journal_path(block), head + text + "\n")
+
+
+def list_journal():
+    if not os.path.isdir(JOURNAL_DIR):
+        return []
+    return sorted((os.path.splitext(f)[0] for f in os.listdir(JOURNAL_DIR) if f.endswith(".md")),
+                  key=lambda s: (len(s), s))
+
+
+def _local_summary(text, max_chars=400):
+    """没有 LLM 时的降级摘要：保留头尾，中间省略。有 LLM 时不用它。"""
+    flat = " ".join(text.split())
+    if len(flat) <= max_chars:
+        return flat
+    head, tail = int(max_chars * 0.7), int(max_chars * 0.3)
+    return flat[:head] + " …(中间省略)… " + flat[-tail:]
+
+
+def summarize_text(text, max_chars=400):
+    """用 LLM 把一段对话压成几行；失败则降级为本地截断（绝不静默丢内容）。"""
+    try:
+        if API_KEY or is_local(BASE_URL):
+            out = llm([
+                {"role": "system", "content": "你在压缩聊天记录。只输出 3 行以内的要点，"
+                                              "保留：结论、决定和理由、提到的路径/命令/数字。不要寒暄。"},
+                {"role": "user", "content": text[:12000]},
+            ], temperature=0.2)
+            out = out.strip()
+            if out:
+                return out[:max_chars]
+    except Exception as e:
+        print(f"(摘要调用失败，改用本地截断：{e})", file=sys.stderr)
+    return _local_summary(text, max_chars)
+
+
+class ChatSession:
+    """一次对话的上下文管理：超预算就把最早的几轮压成摘要，原文进 journal/。"""
+
+    def __init__(self, budget=None, summary="", keep_recent=4):
+        self.messages = []
+        self.summary = summary or ""
+        self.blocks = []
+        self.budget = int(budget or CFG.get("history_budget") or 8000)
+        self.keep_recent = keep_recent
+
+    # -- 序列化（网页端来回传） --
+    @classmethod
+    def from_state(cls, messages=None, summary=""):
+        s = cls(summary=summary)
+        s.messages = [m for m in (messages or [])
+                      if m.get("role") in ("user", "assistant") and m.get("content")]
+        return s
+
+    def state(self):
+        return {"history": self.messages, "summary": self.summary, "blocks": self.blocks}
+
+    # -- 压缩 --
+    def size(self):
+        return sum(len(m["content"]) for m in self.messages)
+
+    def compact_if_needed(self):
+        if self.size() <= self.budget or len(self.messages) <= self.keep_recent:
+            return False
+        chunk = self.messages[:-self.keep_recent]
+        self.messages = self.messages[-self.keep_recent:]
+        text = "\n".join(f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}" for m in chunk)
+        block = f"c{len(self.blocks) + 1}"
+        _journal_write(block, text)
+        self.blocks.append(block)
+        self.summary += f"- [{block}] {summarize_text(text)}\n"
+        return True
+
+    # -- 提问 --
+    def ask(self, question):
+        r = retrieve(question)
+        sys_prompt = CHAT_SYS
+        if r["text"]:
+            sys_prompt += f"\n\n# 本地记忆（{r['tier']} 级，{r['count']} 条）\n{r['text']}"
+        if self.summary:
+            sys_prompt += f"\n\n# 较早对话的摘要（原文可用 `log show <块号>` 回读）\n{self.summary}"
+        msgs = [{"role": "system", "content": sys_prompt}] + self.messages + \
+               [{"role": "user", "content": question}]
+        answer = llm(msgs, temperature=0.6)
+        self.messages += [{"role": "user", "content": question},
+                          {"role": "assistant", "content": answer}]
+        self.compact_if_needed()
+        return answer, r
+
+
 # ---------- 共用逻辑 ----------
-
-def memory_corpus(question, max_items=30, budget=30000):
-    """拼出记忆语料；记忆太多时按关键词粗筛。返回 (语料, 条数)。"""
-    items = read_all()
-    if not items:
-        return "", 0
-    corpus = "\n\n".join(f"### {m.get('name', n)}\n{b}" for n, m, b, _ in items)
-    if len(corpus) > budget:
-        toks = [t for t in re.split(r"[\s，。？！,.?!]+", question) if len(t) > 1]
-        def score(item):
-            n, m, b, _ = item
-            t = (n + m.get("description", "") + b).lower()
-            return sum(t.count(t2.lower()) for t2 in toks)
-        items = sorted(items, key=score, reverse=True)[:max_items]
-        corpus = "\n\n".join(f"### {m.get('name', n)}\n{b}" for n, m, b, _ in items)
-    return corpus, len(items)
-
 
 def do_save(text, mtype=None, use_llm=True):
     """保存一条记忆；use_llm 时让模型起名/写摘要。返回条目名。"""
@@ -250,48 +602,9 @@ def do_save(text, mtype=None, use_llm=True):
             except Exception as e:
                 print(f"(LLM 加工失败，回退本地模式：{e})")
     name, path = save_memory(name, desc, mtype or "project", text)
-    rebuild_index()
     print(f"已保存 {path}")
     print(f"  name: {name}\n  description: {desc}")
     return name
-
-
-def print_memories():
-    items = read_all()
-    if not items:
-        print("（还没有记忆，用 save 或 /save 存一条）")
-        return
-    for n, m, _, _ in items:
-        print(f"{n}  [{m.get('type', '?')}] {m.get('description', '')}  ({m.get('created', '?')})")
-    print(f"\n共 {len(items)} 条，索引：{INDEX_FILE}")
-
-
-def print_search(query):
-    q = query.lower()
-    hits = 0
-    for n, m, b, p in read_all():
-        text = (n + "\n" + m.get("description", "") + "\n" + b).lower()
-        if q not in text:
-            continue
-        hits += 1
-        print(f"[{n}] {p}")
-        for line in b.splitlines():
-            if q in line.lower():
-                print("    " + line.strip()[:100])
-    if not hits:
-        print("（本地没有匹配；也可以用 ask / 对话模式直接问模型）")
-
-
-def _read_text_file(path):
-    """读 txt/md：先按 UTF-8（含 BOM），失败回退 GBK 系（Windows 记事本默认编码）。"""
-    with open(path, "rb") as f:
-        raw = f.read()
-    for enc in ("utf-8-sig", "gb18030"):
-        try:
-            return raw.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
 
 
 def import_text(filename, content, mtype=None, use_llm=True):
@@ -315,10 +628,19 @@ def import_text(filename, content, mtype=None, use_llm=True):
     else:
         name, desc, t = stem, body[:60], (mtype or "project")
     name, path = save_memory(name, desc, t, body)
-    rebuild_index()
     print(f"已导入 {path}")
     print(f"  name: {name}\n  description: {desc}\n  type: {t}")
     return name
+
+
+def print_memories():
+    items = read_all()
+    if not items:
+        print("（还没有记忆，用 save 或 /save 存一条）")
+        return
+    for n, m, _, _ in items:
+        print(f"{n}  [{m.get('type', '?')}] {m.get('description', '')}  ({m.get('created', '?')})")
+    print(f"\n共 {len(items)} 条，索引：{INDEX_FILE}")
 
 
 # ---------- 子命令 ----------
@@ -336,32 +658,33 @@ def cmd_search(a):
 
 
 def cmd_show(a):
-    path = memory_path(a.name)
-    if not path:
+    found = find_memory(a.name)
+    if not found:
         sys.exit(f"找不到记忆 {a.name}")
-    print(_read_text_file(path))
+    print(_read_text_file(found[3]))
 
 
 def cmd_ask(a):
     question = " ".join(a.question)
-    corpus, count = memory_corpus(question)
-    if count == 0:
+    r = retrieve(question)
+    if r["count"] == 0:
         sys.exit("本地还没有记忆。")
-    print(f"[模型 {MODEL}，带入 {count} 条记忆]")
+    print(f"[模型 {MODEL} | {r['tier']} 级检索，带入 {r['count']} 条：{', '.join(r['names'])}]")
     answer = llm([
-        {"role": "system",
-         "content": "你是基于本地记忆的问答助手。只依据给出的记忆回答，记忆里没有的就直说，不要编造。回答末尾列出用到的记忆 name。"},
-        {"role": "user", "content": f"# 记忆库\n{corpus}\n\n# 问题\n{question}"},
+        {"role": "system", "content": ASK_SYS},
+        {"role": "user", "content": f"# 记忆库\n{r['text']}\n\n# 问题\n{question}"},
     ])
     print(answer)
 
 
 def cmd_chat(a):
-    _, count = memory_corpus("")
-    print("记忆Harness 对话模式")
-    print(f"模型 {MODEL} @ {BASE_URL} | 记忆 {count} 条 | 本轮对话为临时上下文")
-    print("命令：/save <内容> 存记忆 | /search <词> | /list | /new 清空对话 | /exit 退出\n")
-    history = []
+    idx = load_index()
+    sess = ChatSession(budget=a.budget)
+    print(f"md-memory-harness {VERSION} 对话模式")
+    print(f"模型 {MODEL} @ {BASE_URL} | 记忆 {len(idx['entries'])} 条 | "
+          f"历史预算 {sess.budget} 字符（超了自动摘要）")
+    print("命令：/save <内容> 存记忆 | /search <词> | /list | /history 看摘要 | "
+          "/new 清空 | /exit 退出\n")
     while True:
         try:
             line = input("你> ").strip()
@@ -373,12 +696,16 @@ def cmd_chat(a):
         if line in ("/exit", "/quit", "/q"):
             break
         if line == "/new":
-            history = []
+            sess = ChatSession(budget=sess.budget)
             print("(已清空本轮对话，记忆保留)\n")
             continue
         if line == "/list":
             print_memories()
             print()
+            continue
+        if line == "/history":
+            print(sess.summary or "（还没有压缩过，完整对话都在上下文里）")
+            print(f"块号：{', '.join(sess.blocks) or '（无）'}\n")
             continue
         if line.startswith("/search "):
             print_search(line[len("/search "):].strip())
@@ -390,19 +717,37 @@ def cmd_chat(a):
                 do_save(text)
             print()
             continue
-        history.append({"role": "user", "content": line})
-        corpus, count = memory_corpus(line)
-        prefix = f"{CHAT_SYS}\n\n# 本地记忆\n{corpus}" if corpus else CHAT_SYS
         try:
-            answer = llm([{"role": "system", "content": prefix}] + history[-24:],
-                         temperature=0.6)
+            answer, r = sess.ask(line)
         except Exception as e:
-            print(f"(调用失败：{e})\n")
-            history.pop()
+            print(f"(调用失败：{e})")
+            print()
             continue
-        print(f"AI> {answer}\n")
-        history.append({"role": "assistant", "content": answer})
+        print(f"AI> {answer}")
+        if r["tier"] == "recent":
+            print(f"   （记忆里没搜到相关的，只带了最近 {r['count']} 条）")
+        print()
+    if sess.blocks:
+        print(f"本次压缩了 {len(sess.blocks)} 块对话，原文在 {JOURNAL_DIR}，"
+              f"用 python harness.py log show {sess.blocks[0]} 可回读。")
     print("再见。")
+
+
+def cmd_log(a):
+    blocks = list_journal()
+    if not a.show:
+        if not blocks:
+            print("（还没有压缩过对话；连续聊到超预算时会自动生成）")
+            return
+        for b in blocks:
+            p = _journal_path(b)
+            print(f"{b}  {os.path.getsize(p)} 字节  {p}")
+        print(f"\n回读全文：python harness.py log show {blocks[-1]}")
+        return
+    p = _journal_path(a.show)
+    if not os.path.isfile(p):
+        sys.exit(f"找不到块 {a.show}")
+    print(_read_text_file(p))
 
 
 def cmd_config(a):
@@ -410,10 +755,12 @@ def cmd_config(a):
     if args and args[0] == "set":  # 兼容 "config set key value" 写法
         args = args[1:]
     if not args:
-        print(f"base_url   = {BASE_URL}")
-        print(f"model      = {MODEL}")
-        print(f"api_key    = {'已设置' if API_KEY else '（未设置，本地服务可不设）'}")
-        print(f"memory_dir = {MEM_DIR}")
+        print(f"base_url       = {BASE_URL}")
+        print(f"model          = {MODEL}")
+        print(f"api_key        = {'已设置' if API_KEY else '（未设置，本地服务可不设）'}")
+        print(f"memory_dir     = {MEM_DIR}")
+        print(f"retrieve_budget= {CFG.get('retrieve_budget')} 字符（每次带进 prompt 的记忆上限）")
+        print(f"history_budget = {CFG.get('history_budget')} 字符（对话历史超了自动摘要）")
         print(f"\n配置文件：{CONFIG_FILE}")
         print("优先级：环境变量 > config.json > 默认")
         print("设置示例：python harness.py config set base_url http://127.0.0.1:11434/v1")
@@ -429,24 +776,21 @@ def cmd_config(a):
         with open(CONFIG_FILE, encoding="utf-8") as f:
             cfg = json.load(f)
     cfg[key] = value
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _atomic_write(CONFIG_FILE, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
     print(f"已写入 {CONFIG_FILE}: {key} = {value}")
     print("（环境变量优先于 config.json；下次运行命令即生效）")
 
 
 def cmd_delete(a):
-    path = memory_path(a.name)
-    if not path:
-        sys.exit(f"找不到记忆 {a.name}")
-    os.remove(path)
-    rebuild_index()
-    print(f"已删除 {path}")
+    target = delete_memory(a.name, purge=a.purge)
+    print(f"已{'彻底删除' if a.purge else '移到回收站'} {target}")
 
 
 def cmd_rebuild(a):
-    rebuild_index()
-    print(f"已重建 {INDEX_FILE}")
+    idx = build_index()
+    rebuild_md_index()
+    print(f"已重建索引：{len(idx['entries'])} 条 → {IDX_FILE}")
+    print(f"人类可读索引：{INDEX_FILE}")
 
 
 def cmd_import(a):
@@ -468,7 +812,9 @@ def cmd_import(a):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="本地 Markdown 记忆 harness（存储在本地，加工走 LLM API）")
+    ap = argparse.ArgumentParser(
+        prog="harness.py",
+        description=f"md-memory-harness {VERSION} — 本地 Markdown 记忆（分层检索 + 对话摘要压缩）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("save", help="存一条记忆（默认调 LLM 起名/写摘要）")
@@ -477,7 +823,8 @@ def main():
     p.add_argument("--no-llm", action="store_true", help="不调 API，纯本地保存")
     p.set_defaults(func=cmd_save)
 
-    p = sub.add_parser("chat", help="对话模式：带记忆的连续对话")
+    p = sub.add_parser("chat", help="对话模式：带记忆的连续对话（超预算自动摘要）")
+    p.add_argument("--budget", type=int, default=None, help="历史字符预算，默认取配置")
     p.set_defaults(func=cmd_chat)
 
     p = sub.add_parser("ask", help="带着记忆问 LLM（单次问答）")
@@ -487,28 +834,33 @@ def main():
     p = sub.add_parser("list", help="列出全部记忆")
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("search", help="本地关键词搜索")
+    p = sub.add_parser("search", help="按索引搜索记忆（中文按二元组匹配）")
     p.add_argument("query", help="关键词")
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("show", help="查看某条记忆全文")
-    p.add_argument("name", help="条目名（不含 .md）")
+    p.add_argument("name", help="条目名（文件名或 frontmatter name，不含扩展名）")
     p.set_defaults(func=cmd_show)
 
     p = sub.add_parser("config", help="查看配置，或 config set <key> <value> 写入 config.json")
     p.add_argument("set_args", nargs="*", help="如：config set model qwen2.5:7b")
     p.set_defaults(func=cmd_config)
 
-    p = sub.add_parser("delete", help="删除某条记忆")
-    p.add_argument("name", help="条目名（不含 .md）")
+    p = sub.add_parser("delete", help="删除记忆（默认移到 .trash/，可回捞）")
+    p.add_argument("name", help="条目名（不含扩展名）")
+    p.add_argument("--purge", action="store_true", help="彻底删除，不进回收站")
     p.set_defaults(func=cmd_delete)
 
-    p = sub.add_parser("rebuild", help="根据 md 文件重建 MEMORY.md 索引")
+    p = sub.add_parser("rebuild", help="重建 MEMORY.md 与 .index.json")
     p.set_defaults(func=cmd_rebuild)
+
+    p = sub.add_parser("log", help="查看对话压缩留下的原文块（log show c1 回读全文）")
+    p.add_argument("show", nargs="?", default=None, help="块号，如 c1；省略则列出全部")
+    p.set_defaults(func=cmd_log)
 
     p = sub.add_parser("import", help="导入 .txt/.md 文件为记忆（可一次多个；md 自带 frontmatter 时直接复用）")
     p.add_argument("files", nargs="+", help="文件路径")
-    p.add_argument("--type", default=None, choices=TYPES, help="指定类型；默认自动（md 元数据 > LLM 判断 > project）")
+    p.add_argument("--type", default=None, choices=TYPES, help="指定类型；默认自动")
     p.add_argument("--no-llm", action="store_true", help="不调 API，用文件名当名字、首行当描述")
     p.set_defaults(func=cmd_import)
 
