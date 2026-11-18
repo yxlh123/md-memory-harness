@@ -1,6 +1,10 @@
 {
   "base_url": "http://127.0.0.1:11434/v1",
   "model": "qwen2.5:7b",
+  "models": [
+    {"id": "qwen2.5:7b", "label": "本地 · 纯文本"},
+    {"id": "qwen3-vl:4b", "label": "本地 · 能看图"}
+  ],
   "api_key": "",
   "memory_dir": "",
   "retrieve_budget": "6000",

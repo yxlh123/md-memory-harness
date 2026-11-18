@@ -79,7 +79,7 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | `rebuild` | 重建 `MEMORY.md` 和 `.index.json` |
 | `config [set <key> <value>]` | 查看/写入配置 |
 
-网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config}`。
+网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config,model}`。
 
 网页端启动参数：`python webui.py [端口] [--lan] [--host IP] [--token 口令] [--no-open]`。
 
@@ -188,12 +188,35 @@ created: 2026-11-18
 | --- | --- | --- | --- |
 | `base_url` | `MEMORY_LLM_BASE_URL` | 智谱 `https://open.bigmodel.cn/api/paas/v4` | OpenAI 兼容地址（带 `/v1`） |
 | `api_key` | `MEMORY_LLM_API_KEY` | 空 | 本地服务可留空 |
-| `model` | `MEMORY_LLM_MODEL` | `glm-4-flash` | 模型名 |
+| `model` | `MEMORY_LLM_MODEL` | `glm-4-flash` | 当前模型名 |
+| `models` | — | 只有 `model` 一项 | 可选模型列表 `[{"id","label"}]`，网页端下拉用 |
 | `memory_dir` | `MEMORY_DIR` | `./memories` | 记忆目录 |
 | `retrieve_budget` | — | `6000` | 每次带进 prompt 的记忆字符上限 |
 | `history_budget` | — | `8000` | 对话历史字符上限，超了压摘要 |
 
 也可以用 `python harness.py config set model qwen3:4b` 写入 `config.json`。
+
+### 多个模型之间切换
+
+`config.json` 里可以放一张 `models` 列表，把常用的模型都写上（`id` 后面跟个好看的 `label`）：
+
+```json
+"model": "glm-4v-flash",
+"models": [
+  {"id": "glm-4v-flash", "label": "看图 · 16K"},
+  {"id": "glm-4-flash",  "label": "长文本 · 128K"}
+]
+```
+
+之后有三个切换入口，改的都是同一份 `config.json`：
+
+- 网页端右上角的下拉框（切完立刻生效，命令行下次运行也用它）；
+- `python harness.py config set model glm-4-flash`；
+- `POST /api/model {"model": "glm-4-flash"}`。
+
+`models` 里的第一个会被当成默认展示顺序，当前 `model` 不在列表里时也会自动补进去。不写 `models` 就只有一个模型，行为跟以前一样。
+
+> 小提示：同一家厂商的模型共用 `base_url`；要跨厂商（比如本机 Ollama ↔ 智谱）得连着 `base_url` 一起改，因为 `base_url` 是全局的一个值。
 
 ## 已知局限（都是刻意的取舍）
 
@@ -208,7 +231,7 @@ created: 2026-11-18
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 28 个用例，不联网
+python -m unittest discover -s tests -v     # 32 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 

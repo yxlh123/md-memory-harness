@@ -34,7 +34,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -42,6 +42,7 @@ _DEFAULTS = {
     "base_url": "https://open.bigmodel.cn/api/paas/v4",
     "api_key": "",
     "model": "glm-4-flash",
+    "models": [],                # 可选模型列表：[{"id": "...", "label": "..."}]，网页端下拉切换用
     "memory_dir": "",
     "retrieve_budget": "6000",   # 每次带进 prompt 的记忆字符数上限
     "history_budget": "8000",    # 对话历史字符数上限，超了就把旧对话压成摘要
@@ -73,6 +74,57 @@ CFG = load_config()
 BASE_URL = CFG["base_url"].rstrip("/")
 API_KEY = CFG["api_key"] or os.environ.get("ZHIPUAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
 MODEL = CFG["model"]
+
+
+def _norm_models(raw, current):
+    """把配置里的 models 洗成 [{"id","label"}]，并保证当前模型一定在里面。"""
+    out = []
+    for item in raw or []:
+        if isinstance(item, str) and item.strip():
+            out.append({"id": item.strip(), "label": item.strip()})
+        elif isinstance(item, dict) and item.get("id"):
+            mid = str(item["id"]).strip()
+            if mid:
+                out.append({"id": mid, "label": str(item.get("label") or mid)})
+    if not any(m["id"] == current for m in out):
+        out.insert(0, {"id": current, "label": current})
+    return out
+
+
+MODELS = _norm_models(CFG.get("models"), MODEL)
+
+
+def save_config(key, value):
+    """把一项配置合并写进 config.json（原子写），已经存在的其它项保留。"""
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+    cfg[key] = value
+    _atomic_write(CONFIG_FILE, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+    CFG[key] = value
+    return cfg
+
+
+def set_model(name):
+    """切换当前模型：校验在 models 列表里，改内存里的 MODEL，并写回 config.json。"""
+    global MODEL
+    name = (name or "").strip()
+    ids = [m["id"] for m in MODELS]
+    if not name:
+        raise ValueError("模型名不能为空")
+    if ids and name not in ids:
+        raise ValueError(f"未知模型 {name}，可选：{', '.join(ids)}")
+    MODEL = name
+    if not any(m["id"] == name for m in MODELS):
+        MODELS.insert(0, {"id": name, "label": name})
+    save_config("model", name)
+    return MODEL
+
+
 MEM_DIR = CFG["memory_dir"] or os.path.join(ROOT, "memories")
 INDEX_FILE = os.path.join(MEM_DIR, "MEMORY.md")      # 给人看的索引
 IDX_FILE = os.path.join(MEM_DIR, ".index.json")      # 给程序用的索引
@@ -903,6 +955,9 @@ def cmd_config(a):
     if not args:
         print(f"base_url       = {BASE_URL}")
         print(f"model          = {MODEL}")
+        if len(MODELS) > 1:
+            print("可选模型       = " + " / ".join(f"{m['id']}（{m['label']}）" if m["label"] != m["id"] else m["id"]
+                                                 for m in MODELS))
         print(f"api_key        = {'已设置' if API_KEY else '（未设置，本地服务可不设）'}")
         print(f"memory_dir     = {MEM_DIR}")
         print(f"retrieve_budget= {CFG.get('retrieve_budget')} 字符（每次带进 prompt 的记忆上限）")
@@ -910,6 +965,7 @@ def cmd_config(a):
         print(f"\n配置文件：{CONFIG_FILE}")
         print("优先级：环境变量 > config.json > 默认")
         print("设置示例：python harness.py config set base_url http://127.0.0.1:11434/v1")
+        print("切换模型：python harness.py config set model glm-4-flash（或网页端点右上角下拉）")
         return
     if len(args) != 2:
         sys.exit("用法：config            查看配置\n      config set <key> <value>  写入配置\n"
@@ -917,12 +973,14 @@ def cmd_config(a):
     key, value = args
     if key not in _DEFAULTS:
         sys.exit(f"未知配置项 {key}，可选：{' / '.join(_DEFAULTS)}")
-    cfg = {}
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-    cfg[key] = value
-    _atomic_write(CONFIG_FILE, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+    if key == "model":
+        try:
+            set_model(value)
+        except ValueError as e:
+            sys.exit(str(e))
+        print(f"已切换到模型 {MODEL}（已写入 {CONFIG_FILE}）")
+        return
+    save_config(key, value)
     print(f"已写入 {CONFIG_FILE}: {key} = {value}")
     print("（环境变量优先于 config.json；下次运行命令即生效）")
 

@@ -17,6 +17,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +76,7 @@ def api_state():
         "version": harness.VERSION,
         "base_url": harness.BASE_URL,
         "model": harness.MODEL,
+        "models": harness.MODELS,
         "has_key": bool(harness.API_KEY),
         "is_local": harness.is_local(harness.BASE_URL),
         "memory_dir": harness.MEM_DIR,
@@ -175,6 +177,13 @@ def handle_api(path, body):
                              "description": e.get("description", "")}
                             for s, e in ranked[:20]]}
 
+    if path == "/api/model":
+        try:
+            harness.set_model(body.get("model", ""))
+        except ValueError as e:
+            return api_error(str(e))
+        return {"ok": True, "model": harness.MODEL, "state": api_state()}
+
     if path == "/api/config":
         key, value = body.get("key", ""), body.get("value")
         if key not in harness._DEFAULTS or value is None:
@@ -193,7 +202,20 @@ def handle_api(path, body):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MemoryHarnessUI/2.1"
+    server_version = "MemoryHarnessUI/2.3"
+
+    def log_message(self, fmt, *args):
+        """默认只打 stderr，后台跑的时候看不见；这里同时写一份 access.log，方便排查"手机连不上"。"""
+        line = "%s %s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), self.address_string(), fmt % args)
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
+        try:
+            with open(os.path.join(ROOT, "access.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
     def _send(self, code, ctype, payload):
         self.send_response(code)
@@ -268,9 +290,6 @@ class Handler(BaseHTTPRequestHandler):
             result, code = api_error(str(e)), 500
         self._send(code, "application/json; charset=utf-8",
                    json.dumps(result, ensure_ascii=False).encode("utf-8"))
-
-    def log_message(self, *args):  # 静默访问日志
-        pass
 
 
 def main():

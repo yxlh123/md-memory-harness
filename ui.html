@@ -15,6 +15,7 @@
   header { display: flex; align-items: center; gap: 12px; padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--line); }
   header h1 { font-size: 16px; font-weight: 600; }
   .badge { font-size: 12px; color: var(--dim); background: var(--panel2); border: 1px solid var(--line); padding: 2px 10px; border-radius: 99px; }
+  #modelsel { font: inherit; font-size: 12px; color: var(--dim); background: var(--panel2); border: 1px solid var(--line); border-radius: 99px; padding: 3px 8px; max-width: 260px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent2); }
   .dot.off { background: var(--danger); }
   nav { display: flex; gap: 4px; margin-left: auto; }
@@ -81,6 +82,7 @@
   <span class="dot" id="dot"></span>
   <h1>记忆Harness</h1>
   <span class="badge" id="modelbadge">…</span>
+  <select id="modelsel" title="切换模型"></select>
   <span class="badge" id="memcount">…</span>
   <nav>
     <button data-tab="chat" class="on">对话</button>
@@ -173,6 +175,7 @@ function toast(t) { const el = $('#toast'); el.textContent = t; el.style.display
 
 function renderAll() {
   $('#modelbadge').textContent = state.model + ' @ ' + state.base_url;
+  renderModelSelect();
   $('#memcount').textContent = '记忆 ' + state.memories.length + ' 条';
   $('#dot').className = 'dot' + ((state.is_local || state.has_key) ? '' : ' off');
   $('#cfg_base_url').value = state.base_url;
@@ -182,6 +185,26 @@ function renderAll() {
     (state.is_local ? '本地服务（免 Key）' : (state.has_key ? '云端（Key 已设置）' : '⚠ 云端但未设置 Key'));
   renderMemories();
 }
+
+/* ---------- 模型切换 ---------- */
+function renderModelSelect() {
+  const sel = $('#modelsel');
+  const list = state.models && state.models.length ? state.models : [{id: state.model, label: state.model}];
+  sel.innerHTML = list.map(m => `<option value="${m.id}">${m.label || m.id}</option>`).join('');
+  sel.value = state.model;
+}
+$('#modelsel').onchange = async () => {
+  const name = $('#modelsel').value;
+  try {
+    const j = await api('/api/model', {model: name});
+    state = j.state;
+    renderAll();
+    toast('已切换到 ' + name + '（已写进 config.json，命令行也用它）');
+  } catch (e) {
+    toast('切换失败：' + e.message);
+    renderModelSelect();
+  }
+};
 
 /* ---------- 对话 ---------- */
 let attachments = [];   // 待发图片（data URL），最多 4 张

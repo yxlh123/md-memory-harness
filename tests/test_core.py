@@ -4,6 +4,7 @@
 
     python -m unittest discover -s tests -v
 """
+import json
 import os
 import shutil
 import sys
@@ -333,6 +334,52 @@ class TestLan(unittest.TestCase):
     def test_lan_ips_returns_only_private(self):
         import webui
         self.assertTrue(all(webui._private(ip) for ip in webui.lan_ips()))
+
+
+class TestModelSwitch(unittest.TestCase):
+    """模型列表与切换：未知名字要拒绝，切换后要写进 config.json。"""
+
+    def setUp(self):
+        self.old_cfg = harness.CONFIG_FILE
+        self.old_models = list(harness.MODELS)
+        self.old_model = harness.MODEL
+        self.cfg_path = os.path.join(TMP, "switch-config.json")
+        if os.path.exists(self.cfg_path):
+            os.remove(self.cfg_path)
+        harness.CONFIG_FILE = self.cfg_path
+        harness.MODELS = harness._norm_models(
+            [{"id": "glm-4v-flash", "label": "看图版"}, "glm-4-flash"], "glm-4v-flash")
+
+    def tearDown(self):
+        harness.CONFIG_FILE = self.old_cfg
+        harness.MODELS = self.old_models
+        harness.MODEL = self.old_model
+        if os.path.exists(self.cfg_path):
+            os.remove(self.cfg_path)
+
+    def test_current_model_is_always_in_list(self):
+        models = harness._norm_models(["only-one"], "another")
+        self.assertEqual(models[0]["id"], "another")
+        ids = [m["id"] for m in models]
+        self.assertIn("only-one", ids)
+
+    def test_str_items_get_a_label(self):
+        models = harness._norm_models(["abc"], "abc")
+        self.assertEqual(models, [{"id": "abc", "label": "abc"}])
+
+    def test_switch_persists_to_config(self):
+        harness.set_model("glm-4-flash")
+        self.assertEqual(harness.MODEL, "glm-4-flash")
+        with open(self.cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["model"], "glm-4-flash")
+
+    def test_unknown_model_rejected(self):
+        with self.assertRaises(ValueError):
+            harness.set_model("not-a-model")
+        with self.assertRaises(ValueError):
+            harness.set_model("")
+        self.assertEqual(harness.MODEL, self.old_model)
 
 
 if __name__ == "__main__":

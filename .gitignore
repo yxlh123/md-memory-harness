@@ -6,3 +6,4 @@ config.json
 memories/.index.json
 memories/.trash/
 .venv/
+access.log
