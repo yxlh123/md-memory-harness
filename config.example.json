@@ -1,0 +1,8 @@
+{
+  "base_url": "http://127.0.0.1:11434/v1",
+  "model": "qwen2.5:7b",
+  "api_key": "",
+  "memory_dir": "",
+  "retrieve_budget": "6000",
+  "history_budget": "8000"
+}

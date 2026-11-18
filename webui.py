@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""记忆Harness 本地网页界面。
+"""md-memory-harness 本地网页界面。
 
 启动：python webui.py [端口] [--no-open]    默认端口 8765，自动打开浏览器
-数据与配置完全复用 harness.py；仅监听 127.0.0.1，无外部依赖。
+数据和配置完全复用 harness.py；只监听 127.0.0.1，无第三方依赖。
+
+与命令行版的区别只有一处：网页端把对话历史（history + summary）放在浏览器里，
+每次请求带上来，服务端用 harness.ChatSession 做同样的「超预算就摘要」处理，
+再把压缩后的 history / summary 传回去，所以刷新页面之前不会丢上下文。
 """
 import importlib
 import json
@@ -16,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
@@ -28,16 +33,21 @@ DEFAULT_PORT = 8765
 
 
 def api_state():
+    idx = harness.load_index()
     return {
+        "version": harness.VERSION,
         "base_url": harness.BASE_URL,
         "model": harness.MODEL,
         "has_key": bool(harness.API_KEY),
         "is_local": harness.is_local(harness.BASE_URL),
         "memory_dir": harness.MEM_DIR,
+        "journal": len(harness.list_journal()),
+        "history_budget": int(harness.CFG.get("history_budget") or 8000),
         "memories": [{"name": n, "type": m.get("type", "?"),
                       "description": m.get("description", ""),
                       "created": m.get("created", "")}
                      for n, m, _, _ in harness.read_all()],
+        "indexed": len(idx["entries"]),
     }
 
 
@@ -51,12 +61,15 @@ def handle_api(path, body):
         msg = body.get("message", "").strip()
         if not msg:
             return api_error("消息为空")
-        history = [h for h in body.get("history", [])
-                   if h.get("role") in ("user", "assistant") and h.get("content")][-24:]
-        corpus, count = harness.memory_corpus(msg)
-        prefix = harness.CHAT_SYS + ("\n\n# 本地记忆\n" + corpus if corpus else "")
-        messages = [{"role": "system", "content": prefix}] + history + [{"role": "user", "content": msg}]
-        return {"reply": harness.llm(messages, temperature=0.6), "used_memories": count}
+        sess = harness.ChatSession.from_state(body.get("history", []), body.get("summary", ""))
+        try:
+            reply, r = sess.ask(msg)
+        except Exception as e:
+            return api_error(f"调用模型失败：{e}")
+        out = {"reply": reply, "tier": r["tier"], "used_memories": r["count"],
+               "used_names": r["names"]}
+        out.update(sess.state())          # history / summary / blocks 回传给浏览器保存
+        return out
 
     if path == "/api/save":
         text = body.get("text", "").strip()
@@ -71,23 +84,31 @@ def handle_api(path, body):
         if (not name or os.path.basename(name) != name or name == "MEMORY"
                 or name.startswith(".")):
             return api_error("无效的条目名")
-        path_md = harness.memory_path(name)  # 支持 .md/.markdown/.txt
-        if not path_md:
-            return api_error("找不到该记忆")
-        os.remove(path_md)
-        harness.rebuild_index()
-        return {"ok": True}
+        try:
+            target = harness.delete_memory(name, purge=bool(body.get("purge")))
+        except FileNotFoundError as e:
+            return api_error(str(e))
+        return {"ok": True, "path": target}
 
     if path == "/api/import":
         filename = body.get("filename", "")
         content = body.get("content") or ""
         if not filename or not content.strip():
             return api_error("文件名为空或内容为空")
+        if os.path.basename(filename) != filename:
+            return api_error("文件名不能带路径")
         if len(content) > 200_000:
             return api_error("文件过大（>200KB），请拆分后导入")
         name = harness.import_text(filename, content, mtype=body.get("type") or None,
                                    use_llm=bool(body.get("use_llm", True)))
         return {"name": name}
+
+    if path == "/api/search":
+        q = body.get("query", "").strip()
+        ranked = harness.rank_entries(q)
+        return {"results": [{"score": s, "name": e["name"], "type": e.get("type", "?"),
+                             "description": e.get("description", "")}
+                            for s, e in ranked[:20]]}
 
     if path == "/api/config":
         key, value = body.get("key", ""), body.get("value")
@@ -98,8 +119,8 @@ def handle_api(path, body):
             with open(harness.CONFIG_FILE, encoding="utf-8") as f:
                 cfg = json.load(f)
         cfg[key] = str(value)
-        with open(harness.CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        harness._atomic_write(harness.CONFIG_FILE,
+                              json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
         importlib.reload(harness)  # 新配置立即生效
         return {"ok": True, "state": api_state()}
 
@@ -107,7 +128,7 @@ def handle_api(path, body):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MemoryHarnessUI/1.0"
+    server_version = "MemoryHarnessUI/2.0"
 
     def _send(self, code, ctype, payload):
         self.send_response(code)
@@ -150,7 +171,7 @@ def main():
         port = int(args[0])
     open_browser = "--no-open" not in args
     url = f"http://127.0.0.1:{port}/"
-    print(f"记忆Harness 界面: {url}   (Ctrl+C 退出)")
+    print(f"md-memory-harness 界面: {url}   (Ctrl+C 退出)")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
