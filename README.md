@@ -1,5 +1,9 @@
 # md-memory-harness
 
+[![tests](https://github.com/yxlh123/md-memory-harness/actions/workflows/tests.yml/badge.svg)](https://github.com/yxlh123/md-memory-harness/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+
 一个**只用 Python 标准库**的本地 Markdown 记忆库：把记忆存成一个个 `.md` 文件，聊天时按需检索，对话变长就自动摘要、原文留档。带的网页界面和命令行都能用。
 
 它解决的问题很小也很具体：**大多数"本地记忆"脚本其实是把整个记忆库塞进 prompt，聊久了再把对话一截了之**。记忆一多就顶不住，一截断就忘事。
