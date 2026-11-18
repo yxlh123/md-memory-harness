@@ -163,6 +163,33 @@ class TestChatCompaction(unittest.TestCase):
         self.assertEqual(s2.summary, "旧摘要")
         self.assertEqual(len(s2.messages), 1)
 
+    def test_blocks_survive_roundtrip_and_never_overwrite(self):
+        """网页端每次请求都是从 state 复原的新会话，块号必须接着数，不能重号覆盖。"""
+        s = harness.ChatSession(budget=50, keep_recent=2)
+        s.messages = [{"role": "user", "content": "第%d轮 " % i + "内容" * 20} for i in range(6)]
+        s.compact_if_needed()
+        st = s.state()
+
+        s2 = harness.ChatSession.from_state(st["history"], st["summary"], st["blocks"])
+        s2.budget, s2.keep_recent = 50, 2          # from_state 不带预算，测试里手动设小
+        s2.messages += [{"role": "user", "content": "x" * 60},
+                        {"role": "assistant", "content": "y" * 60},
+                        {"role": "user", "content": "z" * 60},
+                        {"role": "assistant", "content": "w" * 60}]
+        s2.compact_if_needed()
+
+        self.assertEqual(s2.blocks, ["c1", "c2"])
+        c1 = open(os.path.join(harness.JOURNAL_DIR, "c1.md"), encoding="utf-8").read()
+        self.assertNotIn("x" * 60, c1, "第二轮不能覆盖第一轮的原文")
+
+    def test_block_numbering_continues_after_restart(self):
+        """命令行重开一个会话（不带 blocks）也要接着 journal/ 里已有的块号。"""
+        s = harness.ChatSession(budget=50, keep_recent=2)
+        s.messages = [{"role": "user", "content": "第%d轮 " % i + "内容" * 20} for i in range(6)]
+        s.compact_if_needed()
+        s3 = harness.ChatSession(budget=50, keep_recent=2)
+        self.assertEqual(s3.blocks, ["c1"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

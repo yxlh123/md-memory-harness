@@ -147,7 +147,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-let state = null, history = [], summary = '';   // summary：较早对话的压缩摘要（块号可回读）
+let state = null, history = [], summary = '', blocks = [];   // summary 是压缩摘要，blocks 是已压缩块号
 
 async function api(path, body) {
   const opt = body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {};
@@ -185,12 +185,14 @@ async function send() {
   addMsg('user', text);
   const pend = addMsg('ai', '…');
   try {
-    const j = await api('/api/chat', {message: text, history: history, summary: summary});
+    const j = await api('/api/chat', {message: text, history: history, summary: summary,
+                                      blocks: blocks});
     pend.textContent = j.reply;
     history = j.history || history.concat([{role: 'user', content: text},
                                            {role: 'assistant', content: j.reply}]);
     summary = j.summary || summary;
     if (j.blocks && j.blocks.length) {
+      blocks = j.blocks;
       $('#memcount').title = '已压缩对话块：' + j.blocks.join(', ') + '（原文在 journal/）';
     }
   } catch (e) {

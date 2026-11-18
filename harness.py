@@ -493,10 +493,16 @@ def _journal_path(block):
 
 def _journal_write(block, text):
     os.makedirs(JOURNAL_DIR, exist_ok=True)
+    path = _journal_path(block)
     head = (f"# 对话原文 #{block}\n\n"
             f"> 生成于 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}，"
             f"被压缩进摘要的原始对话。\n\n")
-    _atomic_write(_journal_path(block), head + text + "\n")
+    body = head + text + "\n"
+    if os.path.exists(path):                      # 撞号也不覆盖，接着往下写
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n\n---\n\n" + body)
+        return
+    _atomic_write(path, body)
 
 
 def list_journal():
@@ -535,17 +541,18 @@ def summarize_text(text, max_chars=400):
 class ChatSession:
     """一次对话的上下文管理：超预算就把最早的几轮压成摘要，原文进 journal/。"""
 
-    def __init__(self, budget=None, summary="", keep_recent=4):
+    def __init__(self, budget=None, summary="", keep_recent=4, blocks=None):
         self.messages = []
         self.summary = summary or ""
-        self.blocks = []
+        # 块号接着 journal/ 里已有的往下数，重启或网页刷新都不会重号
+        self.blocks = list(blocks) if blocks else list_journal()
         self.budget = int(budget or CFG.get("history_budget") or 8000)
         self.keep_recent = keep_recent
 
     # -- 序列化（网页端来回传） --
     @classmethod
-    def from_state(cls, messages=None, summary=""):
-        s = cls(summary=summary)
+    def from_state(cls, messages=None, summary="", blocks=None):
+        s = cls(summary=summary, blocks=blocks)
         s.messages = [m for m in (messages or [])
                       if m.get("role") in ("user", "assistant") and m.get("content")]
         return s

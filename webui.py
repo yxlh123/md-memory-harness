@@ -61,7 +61,8 @@ def handle_api(path, body):
         msg = body.get("message", "").strip()
         if not msg:
             return api_error("消息为空")
-        sess = harness.ChatSession.from_state(body.get("history", []), body.get("summary", ""))
+        sess = harness.ChatSession.from_state(body.get("history", []), body.get("summary", ""),
+                                              body.get("blocks", []))
         try:
             reply, r = sess.ask(msg)
         except Exception as e:
