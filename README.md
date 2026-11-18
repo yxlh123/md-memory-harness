@@ -188,10 +188,28 @@ created: 2026-11-18
 | 压缩摘要索引 | `journal/.summary.md` | **自动**（每次压缩后原子写；重开会话自动读回） |
 | 图片 | `journal/images/<时间>-<随机>.png` | **自动**（发图时落盘，md 里只留路径） |
 | 检索索引 | `memories/.index.json` | **自动**（惰性重建：记忆文件变了、或签名对不上就重扫） |
-| 记忆条目 | `memories/<名字>.md` | **手动**：`save`、命令行 `/save`、网页端「存记忆」 |
+| 记忆条目 | `memories/<名字>.md` | `auto_save=auto` 时**自动**（每轮判断一次）；`suggest` 时先问你；`off` 时纯手动 |
 | 记忆总览 | `memories/MEMORY.md` | **自动**（增删记忆时重建，只给人看） |
 
-也就是说：**聊天本身写的是 `journal/`，记忆库 `memories/` 写不写由你决定**。想让某句话进长期记忆，就 `save` 一下；不存也照样能聊，只是它只活在 `journal/` 的压缩块里。
+也就是说：`journal/` 是聊天留下的痕迹，`memories/` 是长期知识。默认 `auto_save=auto`，模型觉得"这句话里有该长期记住的东西"就直接写进 `memories/`；不想让它自作主张就切到 `suggest`（每轮弹一句"要记吗"）或 `off`（只存你手动的）。
+
+## 记忆自动捕获（auto_save）
+
+每轮回答完，会多一次很短的小调用，问模型："这一轮里有没有该长期记住的、关于用户本人的稳定信息？"
+
+- **只认用户说的话**：偏好、习惯、身份、在做的项目、对你的长期要求。
+- **不记**：一次性问题、临时数字、助手自己说的话、常识。
+- 输出候选（最多 2 条），先跟已有记忆比对，太像就跳过（不会存重复条目）。
+
+三档开关，网页「配置」页或 `config.json` 的 `auto_save` 都能改：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto`（默认） | 直接存进 `memories/`，聊天里回一句"🧠 已自动记住：xxx"，不想要就去「记忆」页删 |
+| `suggest` | 不回存，只在回答下面弹一条"🧠 记一条？[保存][不用]" |
+| `off` | 完全不猜，只存你手动 `save` 的 |
+
+代价是多一次小调用（约 0.5 秒、几十 token）。嫌慢就设 `off`；觉得记太碎就设 `suggest` 过一遍眼。
 
 ## 配置
 
@@ -206,6 +224,7 @@ created: 2026-11-18
 | `memory_dir` | `MEMORY_DIR` | `./memories` | 记忆目录 |
 | `retrieve_budget` | — | `6000` | 每次带进 prompt 的记忆字符上限 |
 | `history_budget` | — | `8000` | 对话历史字符上限，超了压摘要 |
+| `auto_save` | — | `auto` | 记忆自动捕获：`auto` / `suggest` / `off` |
 
 也可以用 `python harness.py config set model qwen3:4b` 写入 `config.json`。
 
@@ -244,7 +263,7 @@ created: 2026-11-18
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 35 个用例，不联网
+python -m unittest discover -s tests -v     # 39 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 

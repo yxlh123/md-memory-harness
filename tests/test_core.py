@@ -409,5 +409,69 @@ class TestModelSwitch(unittest.TestCase):
         self.assertEqual(harness.MODEL, self.old_model)
 
 
+class TestAutoCapture(unittest.TestCase):
+    """自动捕获记忆：auto 直接存、suggest 只给候选、off 不打扰。"""
+
+    def setUp(self):
+        reset()
+        self.old_llm = harness.llm
+        self.old_mode = harness.CFG.get("auto_save")
+
+    def tearDown(self):
+        harness.llm = self.old_llm
+        harness.CFG["auto_save"] = self.old_mode
+
+    def _fake(self, items):
+        def llm(messages, temperature=0.3):
+            text = messages[-1]["content"]
+            if "记忆提取器" in messages[0]["content"]:
+                return json.dumps({"items": items}, ensure_ascii=False)
+            return "好的。" if "记住" not in text else "记住了。"
+        return llm
+
+    def test_auto_mode_saves_directly(self):
+        harness.CFG["auto_save"] = "auto"
+        harness.llm = self._fake([{"name": "回复偏好", "description": "喜欢结论先说",
+                                   "type": "user", "body": "用户要求结论先说，别啰嗦。"}])
+        s = harness.ChatSession(budget=10000)
+        answer, r = s.ask("我不喜欢啰嗦的回复，结论先说")
+        self.assertEqual(r["saved"], ["回复偏好"])
+        self.assertEqual(r["suggested"], [])
+        names = [n for n, _, _, _ in harness.read_all()]
+        self.assertIn("回复偏好", names, "auto 模式必须真落盘")
+
+    def test_suggest_mode_does_not_write(self):
+        harness.CFG["auto_save"] = "suggest"
+        harness.llm = self._fake([{"name": "回复偏好", "description": "喜欢结论先说",
+                                   "type": "user", "body": "用户要求结论先说。"}])
+        s = harness.ChatSession(budget=10000)
+        answer, r = s.ask("我不喜欢啰嗦的回复")
+        self.assertEqual(r["saved"], [])
+        self.assertEqual([c["name"] for c in r["suggested"]], ["回复偏好"])
+        self.assertEqual([n for n, _, _, _ in harness.read_all()], [], "suggest 不该写盘")
+
+    def test_off_mode_skips_extraction(self):
+        harness.CFG["auto_save"] = "off"
+        called = []
+
+        def llm(messages, temperature=0.3):
+            called.append(messages[0]["content"][:10])
+            return "好的。"
+        harness.llm = llm
+        s = harness.ChatSession(budget=10000)
+        s.ask("我不喜欢啰嗦的回复")
+        self.assertEqual(len(called), 1, "off 模式不该再花一次提取调用")
+
+    def test_duplicate_is_not_saved_twice(self):
+        harness.CFG["auto_save"] = "auto"
+        harness.llm = self._fake([{"name": "回复偏好", "description": "结论先说",
+                                   "type": "user", "body": "用户要求结论先说。"}])
+        s = harness.ChatSession(budget=10000)
+        s.ask("我不喜欢啰嗦的回复")
+        s.ask("再说一次，我不喜欢啰嗦的回复")
+        names = [n for n, _, _, _ in harness.read_all()]
+        self.assertEqual(len(names), 1, "同一条不该存两遍")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

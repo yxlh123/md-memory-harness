@@ -34,7 +34,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -46,6 +46,7 @@ _DEFAULTS = {
     "memory_dir": "",
     "retrieve_budget": "6000",   # 每次带进 prompt 的记忆字符数上限
     "history_budget": "8000",    # 对话历史字符数上限，超了就把旧对话压成摘要
+    "auto_save": "auto",         # 记忆自动捕获：auto 直接存 / suggest 先问一句 / off 不猜
 }
 _ENV_KEYS = {
     "base_url": "MEMORY_LLM_BASE_URL",
@@ -554,7 +555,56 @@ def smart_meta(text):
     return meta.get("name", ""), meta.get("description", text[:40]), meta.get("type", "project")
 
 
-# ---------- 对话层：超预算就摘要，原文留档 ----------
+CAPTURE_SYS = """你是记忆提取器。看一轮对话（用户说的 + 助手答的），挑出**值得长期记住**的、
+关于用户本人的稳定信息：偏好、习惯、身份、在做的项目、对助手的长期要求。
+
+不要记：一次性的问题、临时的数字/时间、助手自己的话、常识、从上下文能直接推出来的东西。
+宁缺毋滥——没有就返回空列表。
+
+只输出 JSON：{"items": [{"name": "6-16 字中文短语", "description": "一句话",
+"type": "user|feedback|project|reference", "body": "一两句，写结论不写过程"}]}
+最多 2 条。"""
+
+_PREF_HINT = re.compile(r"我(喜欢|不喜欢|偏好|讨厌|习惯|一般|通常|总是|讨厌|希望|要求|正在|在做|负责)|记[住下]|以后")
+
+
+def capture_candidates(question, answer=""):
+    """让模型判断这一轮有没有值得存进长期记忆的东西；返回候选列表（可能为空）。"""
+    text = (question or "").strip()
+    if len(text) < 6 and not _PREF_HINT.search(text):
+        return []                       # 太短又不带偏好信号，不值得花一次调用
+    try:
+        out = llm([
+            {"role": "system", "content": CAPTURE_SYS},
+            {"role": "user", "content": f"用户：{text}\n助手：{(answer or '')[:400]}"},
+        ], temperature=0.1)
+        data = extract_json(out)
+    except Exception:
+        return []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    out_items = []
+    for it in items[:2]:
+        if not isinstance(it, dict):
+            continue
+        body = str(it.get("body") or "").strip()
+        name = str(it.get("name") or "").strip()
+        if not body or not name:
+            continue
+        mtype = it.get("type") if it.get("type") in ("user", "feedback", "project", "reference") else "project"
+        out_items.append({"name": name, "description": str(it.get("description") or body[:40]),
+                          "type": mtype, "body": body})
+    return out_items
+
+
+def _already_known(name):
+    """名字/内容跟已有记忆撞得太像就别重复存。"""
+    try:
+        ranked = rank_entries(name)
+    except Exception:
+        return False
+    return bool(ranked) and ranked[0][0] >= 0.9
 
 def _journal_path(block):
     return os.path.join(JOURNAL_DIR, f"{block}.md")
@@ -775,7 +825,27 @@ class ChatSession:
         self.messages += [{"role": "user", "content": content},
                           {"role": "assistant", "content": answer}]
         self.compact_if_needed()
+        r["saved"], r["suggested"] = self.capture_memory(question, answer)
         return answer, r
+
+    def capture_memory(self, question, answer):
+        """按 auto_save 配置处理"这轮有没有该记的事"：off 不猜，suggest 给候选，auto 直接存。"""
+        mode = str(CFG.get("auto_save") or "suggest").lower()
+        if mode not in ("suggest", "auto") or count_images(question):
+            return [], []
+        cands = [c for c in capture_candidates(question, answer) if not _already_known(c["name"])]
+        if not cands:
+            return [], []
+        if mode == "auto":
+            saved = []
+            for c in cands:
+                try:
+                    save_memory(c["name"], c["description"], c["type"], c["body"])
+                    saved.append(c["name"])
+                except Exception:
+                    pass
+            return saved, []
+        return [], cands
 
 
 # ---------- 共用逻辑 ----------
@@ -953,6 +1023,10 @@ def cmd_chat(a):
         print(f"AI> {answer}")
         if r["tier"] == "recent":
             print(f"   （记忆里没搜到相关的，只带了最近 {r['count']} 条）")
+        if r.get("saved"):
+            print(f"   🧠 已自动记住：{'、'.join(r['saved'])}")
+        for c in r.get("suggested") or []:
+            print(f"   🧠 要记一条吗？{c['name']}：{c['description']}（/save 后回车可手动存）")
         print()
     if sess.blocks:
         print(f"本次压缩了 {len(sess.blocks)} 块对话，原文在 {JOURNAL_DIR}，"
@@ -991,6 +1065,7 @@ def cmd_config(a):
         print(f"memory_dir     = {MEM_DIR}")
         print(f"retrieve_budget= {CFG.get('retrieve_budget')} 字符（每次带进 prompt 的记忆上限）")
         print(f"history_budget = {CFG.get('history_budget')} 字符（对话历史超了自动摘要）")
+        print(f"auto_save      = {CFG.get('auto_save')}（auto 自动存记忆 / suggest 先问 / off 只手动）")
         print(f"\n配置文件：{CONFIG_FILE}")
         print("优先级：环境变量 > config.json > 默认")
         print("设置示例：python harness.py config set base_url http://127.0.0.1:11434/v1")

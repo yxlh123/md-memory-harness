@@ -89,6 +89,7 @@ def api_state():
         "indexed": len(idx["entries"]),
         "summary": harness.load_summary(),     # 磁盘上的压缩摘要，页面刷新后能接上
         "blocks": harness.list_journal(),
+        "auto_save": str(harness.CFG.get("auto_save") or "auto"),
     }
 
 
@@ -136,12 +137,17 @@ def handle_api(path, body):
         except Exception as e:
             return api_error(f"调用模型失败：{e}")
         out = {"reply": reply, "tier": r["tier"], "used_memories": r["count"],
-               "used_names": r["names"], "images": len(images)}
+               "used_names": r["names"], "images": len(images),
+               "saved": r.get("saved") or [], "suggested": r.get("suggested") or []}
         out.update(sess.state())          # history / summary / blocks 回传给浏览器保存
         return out
 
     if path == "/api/save":
         text = body.get("text", "").strip()
+        if body.get("name") and text:            # 前端确认"自动建议"时走这条：字段已备好，不再调模型
+            name, _ = harness.save_memory(str(body["name"])[:40], str(body.get("description") or text[:40]),
+                                          body.get("type") or "project", text)
+            return {"name": name}
         if not text:
             return api_error("内容为空")
         name = harness.do_save(text, mtype=body.get("type") or None,
@@ -190,6 +196,14 @@ def handle_api(path, body):
         key, value = body.get("key", ""), body.get("value")
         if key not in harness._DEFAULTS or value is None:
             return api_error("无效配置项")
+        if key == "auto_save" and str(value) not in ("auto", "suggest", "off"):
+            return api_error("auto_save 只能是 auto / suggest / off")
+        if key == "model":
+            try:
+                harness.set_model(str(value))
+            except ValueError as e:
+                return api_error(str(e))
+            return {"ok": True, "state": api_state()}
         cfg = {}
         if os.path.exists(harness.CONFIG_FILE):
             with open(harness.CONFIG_FILE, encoding="utf-8") as f:
