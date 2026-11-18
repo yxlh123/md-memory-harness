@@ -147,7 +147,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-let state = null, history = [], summary = '';   // summary：较早对话的压缩摘要（块号可回读）
+let state = null, history = [];
 
 async function api(path, body) {
   const opt = body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {};
@@ -183,18 +183,15 @@ async function send() {
   if (!text) return;
   box.value = ''; btn.disabled = true;
   addMsg('user', text);
+  history.push({role: 'user', content: text});
   const pend = addMsg('ai', '…');
   try {
-    const j = await api('/api/chat', {message: text, history: history, summary: summary});
+    const j = await api('/api/chat', {message: text, history: history.slice(0, -1)});
     pend.textContent = j.reply;
-    history = j.history || history.concat([{role: 'user', content: text},
-                                           {role: 'assistant', content: j.reply}]);
-    summary = j.summary || summary;
-    if (j.blocks && j.blocks.length) {
-      $('#memcount').title = '已压缩对话块：' + j.blocks.join(', ') + '（原文在 journal/）';
-    }
+    history.push({role: 'assistant', content: j.reply});
   } catch (e) {
     pend.textContent = '⚠ 调用失败：' + e.message;
+    history.pop();
   }
   btn.disabled = false; box.focus();
 }
