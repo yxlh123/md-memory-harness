@@ -159,9 +159,12 @@
 <script>
 const $ = s => document.querySelector(s);
 let state = null, history = [], summary = '', blocks = [];   // summary 是压缩摘要，blocks 是已压缩块号
+// 局域网访问时服务端会给一个口令（在地址的 ?k= 里），每个请求都带上
+const KEY = new URLSearchParams(location.search).get('k') || '';
 
 async function api(path, body) {
-  const opt = body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {};
+  const opt = body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {headers: {}};
+  if (KEY) opt.headers['X-Token'] = KEY;
   const j = await (await fetch(path, opt)).json();
   if (j.error) throw new Error(j.error);
   return j;

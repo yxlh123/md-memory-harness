@@ -26,7 +26,7 @@
 - **对话摘要压缩**：历史超过字符预算时，把较早的对话压成摘要，原文写进 `journal/c1.md`、`c2.md`…，摘要里带块号，`log show c1` 可回读全文。
 - **可换模型**：任何 OpenAI 兼容接口都行（本地 Ollama / 智谱 / DeepSeek / vLLM…）。
 - **能发图片**：命令行 `--image` / `/img`，网页端点 📎 或直接 Ctrl+V 粘贴截图。图片落盘到 `journal/images/`，上下文里只留路径标记，base64 不进 md。
-- **两个界面**：命令行 `harness.py`，网页 `webui.py`（标准库 `http.server`，只监听 `127.0.0.1`）。
+- **两个界面**：命令行 `harness.py`，网页 `webui.py`（标准库 `http.server`）。默认只监听本机，`--lan` 可让同一 WiFi 下的手机/平板打开，带口令保护。
 
 ## 快速开始
 
@@ -81,6 +81,8 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 
 网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config}`。
 
+网页端启动参数：`python webui.py [端口] [--lan] [--host IP] [--token 口令] [--no-open]`。
+
 ## 图片
 
 只对**支持读图的模型**有效（qwen3-vl、qwen2.5-vl、glm-4v、gpt-4o、claude 之类）。模型不支持时接口会报错，`chat` 里会提示你换模型。
@@ -106,6 +108,31 @@ python harness.py chat --image .\chat1.png      # 开场先挂一张
 - 一张图按 `IMG_WEIGHT = 1200` 字符计入对话预算，压缩时图片和它的路径一起进 `journal/cN.md`；回读时看到的是路径，不是图。
 - 单张上限 6MB、一条消息最多 4 张、请求体上限 24MB（`webui.py` 的 `MAX_IMAGE_BYTES` / `MAX_IMAGES` / `MAX_BODY`）。
 - 图片以 data URL 形式发给模型，走的是 OpenAI 多模态格式 `content: [{type:"text"}, {type:"image_url"}]`；老接口只认纯文本的话这条路走不通。
+
+## 手机 / 局域网访问
+
+默认只监听 `127.0.0.1`，别的设备连不上。想用手机、平板、同一 WiFi 下的另一台电脑打开网页端：
+
+```bash
+python webui.py --lan
+```
+
+双击 `ui-lan.bat` 也行。启动后终端会打印几条地址：
+
+```text
+同一个 WiFi 下，手机/别的电脑用下面这个地址打开：
+  http://192.168.1.23:8765/?k=x7k2mq9p
+
+访问口令：x7k2mq9p（已经带在上面链接的 ?k= 里，别把链接发给别人）
+```
+
+把**带 `?k=` 的整条地址**发到手机上打开就行。几点说明：
+
+- `--lan` 会把监听地址改成 `0.0.0.0`（所有网卡），并**自动生成一个 8 位口令**；也可以自己指定 `--token 我的口令`。
+- 口令通过 `?k=` 或 `X-Token` 请求头传，网页端拿到 `?k=` 后会自动给每个请求带上，不用手动登录。
+- 第一次运行 Windows 会弹防火墙提示，必须选**允许**（尤其是「专用网络」那一项），否则手机连不上。
+- **这不是给公网用的**：没有账号体系、没有 HTTPS，口令就是唯一保护，同一网络里的人猜到或看到链接就能读你的全部记忆。只在自己家的 WiFi 里用。
+- 想只绑某一个网卡：`python webui.py --host 192.168.1.23`；端口照老样子跟在后面：`python webui.py 9000 --lan`。
 
 ## 记忆文件长这样
 
@@ -176,11 +203,12 @@ created: 2026-11-18
 - **单进程单用户**：没有文件锁，同时开两个 `webui.py` 写同一条记忆可能互相覆盖。
 - **摘要质量取决于模型**：模型越小摘要越糊，但原文在 `journal/` 里，随时能捞。
 - **图片没做压缩**：6MB 的截图会原样存盘、原样发给模型，多轮带同一张图会重复计费；要省就自己先缩图。
+- **局域网模式只挡手滑**：`--lan` 的口令是明文的、没有 HTTPS、没有账号锁，同一网络里有人抓包或者看到链接就能进。不要把它暴露到公网（别做端口映射）。
 
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 26 个用例，不联网
+python -m unittest discover -s tests -v     # 28 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 

@@ -320,5 +320,20 @@ class TestWebApi(unittest.TestCase):
         self.assertEqual(out2["blocks"], ["c1", "c2"], "第二块不能覆盖 c1")
 
 
+class TestLan(unittest.TestCase):
+    """局域网模式：只对外报真正能用的网段，口令生成的地址要能拼出来。"""
+
+    def test_private_filter(self):
+        import webui
+        for ip in ("192.168.1.5", "10.0.0.2", "172.16.0.9", "172.31.255.1"):
+            self.assertTrue(webui._private(ip), ip)
+        for ip in ("127.0.0.1", "169.254.123.68", "172.32.0.1", "8.8.8.8", "192.169.1.1"):
+            self.assertFalse(webui._private(ip), ip)
+
+    def test_lan_ips_returns_only_private(self):
+        import webui
+        self.assertTrue(all(webui._private(ip) for ip in webui.lan_ips()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
