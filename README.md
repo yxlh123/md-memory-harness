@@ -269,6 +269,10 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 测试用 `.test-tmp/`（项目内）而不是系统临时目录，Windows 上被沙箱/权限拦的时候不用改代码。
 
+## 下一步（还没做）
+
+排期见 [ROADMAP.md](ROADMAP.md)：记忆合并/冲突处理（consolidate）、supersede 版本机制、TF-IDF 检索加权、本地 embedding 语义检索。当前版本 `2.5.0` 不含这些，别按上面的说明去找这些功能。
+
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
