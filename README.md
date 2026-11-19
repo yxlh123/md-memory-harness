@@ -271,7 +271,7 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：记忆合并/冲突处理（consolidate）、supersede 版本机制、TF-IDF 检索加权、本地 embedding 语义检索。当前版本 `2.5.0` 不含这些，别按上面的说明去找这些功能。
+排期见 [ROADMAP.md](ROADMAP.md)：记忆合并/冲突处理（consolidate）、supersede 版本机制、TF-IDF 检索加权、本地 embedding 语义检索、记忆元数据补全、流式输出、memories 目录 git 化、网页管理面、token 用量统计。当前版本 `2.5.0` 不含这些，别按上面的说明去找这些功能。
 
 ## 许可
 
