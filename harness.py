@@ -841,6 +841,9 @@ def retrieve(question, budget_chars=None):
     touch_usage(names)
     # 压缩掉的对话原文：跟记忆一起给模型，别让「上周定的方案」只存在于人脑子里
     jtext, jblocks = _journal_hits(question, budget_chars=max(600, budget_chars - used))
+    if jtext and tier == "recent":
+        # 已经捞到相关原话了，就别再塞 8 条无关的「最近记忆」当噪声
+        text, parts, names, tier = "", [], [], "journal"
     return {"text": text, "tier": tier, "names": names,
             "count": len(parts), "journal": jtext, "blocks": jblocks}
 
@@ -1298,14 +1301,17 @@ def rank_journal(question, idx=None, limit=2, min_score=0.35):
     return out[:limit]
 
 
-def _journal_snippet(block, question, width=160):
-    """在原文块里找命中词所在的那一行，截一小段返回。"""
+def _journal_snippet(block, question, width=400):
+    """原文块很短就整段给（别把关键的后半句截掉），长了只摘命中最多的那一行。"""
     try:
         text = _read_text_file(_journal_path(block))
     except OSError:
         return ""
     lines = [l.strip() for l in text.splitlines()
              if l.strip() and not l.startswith("#") and not l.startswith(">")]
+    body = "\n".join(lines)
+    if len(body) <= width:
+        return body
     q = tokenize(question)
     best, best_hit = "", set()
     for line in lines:
@@ -1314,8 +1320,8 @@ def _journal_snippet(block, question, width=160):
             best, best_hit = line, hit
     if not best:
         best = lines[0] if lines else ""
-    if len(best) > width:
-        best = best[:width] + "…"
+    if len(best) > 160:
+        best = best[:160] + "…"
     return best
 
 
@@ -1546,8 +1552,8 @@ class ChatSession:
         if r["text"]:
             sys_prompt += f"\n\n# 本地记忆（{r['tier']} 级，{r['count']} 条）\n{r['text']}"
         if r.get("journal"):
-            sys_prompt += ("\n\n# 较早对话的原文片段（压缩前的原话，和摘要冲突时以这里为准）\n"
-                           + r["journal"])
+            sys_prompt += ("\n\n# 从压缩掉的对话里检索到的原话（这是用户自己说过的话，可以直接当事实依据；"
+                           "和摘要冲突时以这里为准）\n" + r["journal"])
         if self.summary:
             summary = self.summary
             if len(summary) > SUMMARY_CAP:
@@ -1769,10 +1775,12 @@ def cmd_ask(a):
     question = " ".join(a.question)
     images = [file_to_data_url(p) for p in (getattr(a, "image", None) or [])]
     r = retrieve(question)
-    if r["count"] == 0 and not images:
-        sys.exit("本地还没有记忆。")
-    print(f"[模型 {MODEL} | {r['tier']} 级检索，带入 {r['count']} 条：{', '.join(r['names'])}]")
-    content = f"# 记忆库\n{r['text']}\n\n# 问题\n{question}"
+    if r["count"] == 0 and not r.get("journal") and not images:
+        sys.exit("本地还没有记忆，也没检索到可用的对话原文。")
+    extra = f"，原文片段 {len(r['blocks'])} 块（{', '.join(r['blocks'])}）" if r.get("journal") else ""
+    print(f"[模型 {MODEL} | {r['tier']} 级检索，带入 {r['count']} 条：{', '.join(r['names'])}{extra}]")
+    jt = f"\n\n# 压缩掉的对话原文（用户说过的话，可当事实依据）\n{r['journal']}" if r.get("journal") else ""
+    content = f"# 记忆库\n{r['text']}{jt}\n\n# 问题\n{question}"
     if images:
         content = [{"type": "text", "text": content}]
         for url in images:
