@@ -35,7 +35,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -583,6 +583,49 @@ def llm(messages, temperature=0.3):
     return data["choices"][0]["message"]["content"]
 
 
+def llm_stream(messages, temperature=0.3):
+    """流式版 llm()：逐段 yield 增量文本（SSE）。
+
+    Ollama / OpenAI / 智谱都支持 `"stream": true`，返回 `data: {...}` 行，
+    增量在 `choices[0].delta.content`。服务端不认流式（直接回 JSON）时，
+    整段当一次产出，调用方无需区分。
+    """
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = "Bearer " + API_KEY
+    elif not is_local(BASE_URL):
+        raise RuntimeError("未配置 API Key（MEMORY_LLM_API_KEY / config set api_key ...）")
+    req = urllib.request.Request(
+        BASE_URL + "/chat/completions",
+        data=json.dumps({"model": MODEL, "messages": messages,
+                         "temperature": temperature, "stream": True}).encode("utf-8"),
+        headers=headers,
+    )
+    with urllib.request.urlopen(req, timeout=180) as r:
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "event-stream" not in ctype:            # 对方忽略了 stream，回的是整段 JSON
+            data = json.loads(r.read().decode("utf-8"))
+            yield data["choices"][0]["message"]["content"]
+            return
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or not line.startswith("data:"):
+                continue                           # 空行（分隔符）和注释行跳过
+            chunk = line[5:].strip()
+            if chunk == "[DONE]":
+                break
+            try:
+                obj = json.loads(chunk)
+            except ValueError:
+                continue                           # 半截行/心跳，忽略
+            choices = obj.get("choices") or []
+            if not choices:
+                continue
+            piece = (choices[0].get("delta") or {}).get("content")
+            if piece:
+                yield piece
+
+
 def extract_json(text):
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
@@ -855,8 +898,8 @@ class ChatSession:
         return True
 
     # -- 提问 --
-    def ask(self, question, images=None):
-        """images：data URL 列表。图片落盘到 journal/images/，进 prompt 用 image_url。"""
+    def prepare(self, question, images=None):
+        """检索记忆、拼 system prompt、把这一轮的 user 消息建好（不调用模型）。"""
         r = retrieve(question)
         sys_prompt = CHAT_SYS
         if r["text"]:
@@ -873,12 +916,31 @@ class ChatSession:
             content = parts
         msgs = [{"role": "system", "content": sys_prompt}] + self.messages + \
                [{"role": "user", "content": content}]
-        answer = llm(msgs, temperature=0.6)
+        return msgs, content, r
+
+    def finish(self, question, content, answer, r):
+        """一轮问答收尾：入历史 → 超预算就压缩 → 判断要不要记记忆。"""
         self.messages += [{"role": "user", "content": content},
                           {"role": "assistant", "content": answer}]
         self.compact_if_needed()
         r["saved"], r["suggested"] = self.capture_memory(question, answer)
-        return answer, r
+        return r
+
+    def ask(self, question, images=None):
+        """images：data URL 列表。图片落盘到 journal/images/，进 prompt 用 image_url。"""
+        msgs, content, r = self.prepare(question, images)
+        answer = llm(msgs, temperature=0.6)
+        return answer, self.finish(question, content, answer, r)
+
+    def ask_stream(self, question, images=None):
+        """流式提问：边跑边 yield 增量文本，结束把最终结果放进 self.last_result。"""
+        msgs, content, r = self.prepare(question, images)
+        buf = []
+        for piece in llm_stream(msgs, temperature=0.6):
+            buf.append(piece)
+            yield piece
+        answer = "".join(buf)
+        self.last_result = (answer, self.finish(question, content, answer, r))
 
     def capture_memory(self, question, answer):
         """按 auto_save 配置处理"这轮有没有该记的事"：off 不猜，suggest 给候选，auto 直接存。"""
@@ -991,11 +1053,20 @@ def cmd_ask(a):
         for url in images:
             content.append({"type": "image_url", "image_url": {"url": url}})
         print(f"[附 {len(images)} 张图]")
-    answer = llm([
+    msgs = [
         {"role": "system", "content": ASK_SYS},
         {"role": "user", "content": content},
-    ])
-    print(answer)
+    ]
+    if getattr(a, "no_stream", False):
+        print(llm(msgs))
+        return
+    try:
+        for piece in llm_stream(msgs):          # 先流一次，失败再退回整段
+            print(piece, end="", flush=True)
+        print()
+    except Exception as e:
+        print(f"\n(流式失败，改用整段：{e})")
+        print(llm(msgs))
 
 
 def cmd_chat(a):
@@ -1058,21 +1129,27 @@ def cmd_chat(a):
             print()
             continue
         try:
-            answer, r = sess.ask(line, pending)
+            if getattr(a, "no_stream", False):
+                answer, r = sess.ask(line, pending)
+                print(f"AI> {answer}")
+            else:
+                print("AI> ", end="", flush=True)   # 逐字出，收尾时自己补换行
+                for piece in sess.ask_stream(line, pending):
+                    print(piece, end="", flush=True)
+                answer, r = sess.last_result
+                print()
             pending = []
         except ValueError as e:
             print(f"(图片有问题：{e})")
             print()
             continue
         except Exception as e:
-            msg = str(e)
             print(f"(调用失败：{e})")
             if pending:
                 print("   提示：如果报的是 vision / image 相关错误，"
                       "说明当前模型（%s）不支持读图，换 qwen2.5-vl、glm-4v、gpt-4o 这类多模态模型。" % MODEL)
             print()
             continue
-        print(f"AI> {answer}")
         if r["tier"] == "recent":
             print(f"   （记忆里没搜到相关的，只带了最近 {r['count']} 条）")
         if r.get("saved"):
@@ -1187,12 +1264,14 @@ def main():
     p.add_argument("--budget", type=int, default=None, help="历史字符预算，默认取配置")
     p.add_argument("--image", action="append", metavar="路径",
                    help="开场先挂一张图（可重复；对话中也可用 /img <路径>）")
+    p.add_argument("--no-stream", action="store_true", help="等模型说完再整段显示（默认逐字出字）")
     p.set_defaults(func=cmd_chat)
 
     p = sub.add_parser("ask", help="带着记忆问 LLM（单次问答）")
     p.add_argument("question", nargs="+", help="问题")
     p.add_argument("--image", action="append", metavar="路径",
                    help="附一张图（可重复），需要模型支持读图")
+    p.add_argument("--no-stream", action="store_true", help="等模型说完再整段显示（默认逐字出字）")
     p.set_defaults(func=cmd_ask)
 
     p = sub.add_parser("list", help="列出全部记忆")

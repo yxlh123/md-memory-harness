@@ -277,12 +277,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found")
 
-    def do_POST(self):
-        parsed = urllib.parse.urlsplit(self.path)
-        path = parsed.path
-        if not self._authed(parsed.query):
-            self._deny(is_api=True)
-            return
+    def _read_json(self):
+        """读请求体；超过 MAX_BODY 返回 (None, 错误 dict)，由调用方回 413。"""
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length > MAX_BODY:
             # 先把请求体读掉再回错误：不然对方还在写，连接会被 reset，前端看不到这条消息
@@ -293,19 +289,71 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 left -= len(chunk)
             self.close_connection = True
-            self._send(413, "application/json; charset=utf-8",
-                       json.dumps(api_error(f"请求太大（{length} 字节，上限 {MAX_BODY}）："
-                                            f"图片别超过 {MAX_IMAGES} 张、单张 6MB"),
-                                  ensure_ascii=False).encode("utf-8"))
+            return None, api_error(f"请求太大（{length} 字节，上限 {MAX_BODY}）："
+                                   f"图片别超过 {MAX_IMAGES} 张、单张 6MB")
+        try:
+            return json.loads(self.rfile.read(length) or b"{}"), None
+        except ValueError as e:
+            return None, api_error(f"请求体不是合法 JSON：{e}")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path
+        if not self._authed(parsed.query):
+            self._deny(is_api=True)
+            return
+        body, err = self._read_json()
+        if err:
+            self._send(413 if "请求太大" in err.get("error", "") else 400,
+                       "application/json; charset=utf-8",
+                       json.dumps(err, ensure_ascii=False).encode("utf-8"))
+            return
+        if path == "/api/chat_stream":
+            self._stream_chat(body)          # 自己写响应头，不走下面的统一回包
             return
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
             result = handle_api(path, body)
             code = 200
         except Exception as e:
             result, code = api_error(str(e)), 500
         self._send(code, "application/json; charset=utf-8",
                    json.dumps(result, ensure_ascii=False).encode("utf-8"))
+
+    def _stream_chat(self, body):
+        """SSE 流式聊天：先逐段推 `data: {"delta": "..."}`，最后一条 `data: {"done": true, ...}`。"""
+        def emit(obj):
+            self.wfile.write(b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n")
+            self.wfile.flush()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True          # 没有 Content-Length，靠关连接告诉浏览器流结束
+
+        msg = (body.get("message") or "").strip()
+        if not msg:
+            emit({"error": "消息为空"})
+            return
+        images, err = clean_images(body.get("images"))
+        if err:
+            emit({"error": err})
+            return
+        sess = harness.ChatSession.from_state(body.get("history", []), body.get("summary", ""),
+                                              body.get("blocks", []))
+        try:
+            for piece in sess.ask_stream(msg, images):
+                emit({"delta": piece})
+            reply, r = sess.last_result
+        except Exception as e:
+            emit({"error": f"调用模型失败：{e}"})
+            return
+        out = {"done": True, "reply": reply, "tier": r["tier"], "used_memories": r["count"],
+               "used_names": r["names"], "images": len(images),
+               "saved": r.get("saved") or [], "suggested": r.get("suggested") or []}
+        out.update(sess.state())
+        emit(out)
 
 
 def main():

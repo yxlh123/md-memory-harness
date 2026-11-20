@@ -58,9 +58,9 @@ frontmatter 再加三个字段：
 
 注意：`last_used` 会在检索时写文件 → 频繁写盘，建议攒批（比如同一进程内合并、或每天落一次），别每命中一次就改 mtime。
 
-## 6. 流式输出（SSE）
+## 6. 流式输出（SSE）—— ✅ 已完成（v2.7.0，2026-11-21）
 
-现在聊天要等模型**吐完整段才显示**，本机 7b 模型要等好几秒，体感像卡住。
+~~现在聊天要等模型**吐完整段才显示**，本机 7b 模型要等好几秒，体感像卡住。~~
 
 - Ollama 和 OpenAI 协议都支持 SSE（Server-Sent Events，服务端逐条推）
 - CLI 和网页都改成逐字出字
@@ -117,6 +117,16 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 - 用户偏好：先给结论再讲理由；英文术语要带中文解释
 
 ## 已完成
+
+### v2.7.0（2026-11-21）—— #6 流式输出
+
+- `harness.py` 新增 `llm_stream(messages, temperature)`：请求带 `"stream": true`，逐行解析 `data:` 的 `choices[0].delta.content`；对方忽略 stream、直接回整段 JSON 时整段当一次产出（`Content-Type` 不是 event-stream 就走这条）
+- `ChatSession` 拆成 `prepare()`（检索 + 拼 prompt）/ `finish()`（入历史 + 压缩 + 记记忆）/ `ask()` / `ask_stream()`；流式版把最终结果放 `self.last_result`
+- 命令行 `chat` / `ask` 默认逐字出字，加 `--no-stream` 回到整段显示；`ask` 流失败会自动退回 `llm()` 整段
+- `webui.py` 新增 `POST /api/chat_stream`（SSE：`data: {"delta":…}` … `data: {"done":true,…state}`），`do_POST` 里把请求体读取抽成 `_read_json()` 复用；无 `Content-Length`、靠关连接表示流结束
+- `ui.html` 新增 `streamChat()`（`fetch` + `ReadableStream` + `TextDecoder` 手动拼 `\n\n` 分帧），服务端没有该接口时自动退回 `/api/chat`
+- 测试新增 `TestStreaming` 5 个：真起 SSE 假服务验解析、忽略 stream 的 JSON 回退、`ask_stream` 收尾入历史、流式也触发压缩、真起 `webui` 服务验 `/api/chat_stream` 事件结构。共 **50 个全绿**
+- 实测智谱 `glm-4v-flash`：首个增量 0.43s，整段 2.37s（47 个增量）；命令行同样逐字
 
 ### v2.6.0（2026-11-21）—— #3 检索加权
 

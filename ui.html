@@ -260,6 +260,39 @@ function addFiles(files) {
   });
 }
 
+/* 流式聊天：服务端逐段推 data: {"delta": ...}，最后一条 data: {"done": true, ...}
+   服务端不支持流式（比如老版本）时自动退回 /api/chat 一次性结果。 */
+async function streamChat(body, onDelta) {
+  const opt = {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)};
+  if (KEY) opt.headers['X-Token'] = KEY;
+  const res = await fetch('/api/chat_stream', opt);
+  if (!res.ok || !res.body || !res.body.getReader) {
+    const j = await api('/api/chat', body);
+    onDelta(j.reply || '');
+    return j;
+  }
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = '', stop = null, reply = '';
+  while (true) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    let i;
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 2);
+      if (!line.startsWith('data:')) continue;
+      let obj;
+      try { obj = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+      if (obj.error) throw new Error(obj.error);
+      if (obj.delta) { reply += obj.delta; onDelta(reply); }
+      else if (obj.done) stop = obj;
+    }
+  }
+  if (!stop) throw new Error('连接断了，模型没回完（可以再发一次）');
+  return stop;
+}
+
 async function send() {
   const box = $('#msg'), text = box.value.trim(), btn = $('#send');
   if (!text && !attachments.length) return;
@@ -269,8 +302,9 @@ async function send() {
   addMsg('user', (imgs.length ? '📎 图片 ' + imgs.length + ' 张' + (text ? '\n' : '') : '') + text);
   const pend = addMsg('ai', '…');
   try {
-    const j = await api('/api/chat', {message: text || '（请看这张图）', history: history,
-                                      summary: summary, blocks: blocks, images: imgs});
+    const j = await streamChat({message: text || '（请看这张图）', history: history,
+                                summary: summary, blocks: blocks, images: imgs},
+                               txt => { pend.textContent = txt; $('#chatlog').scrollTop = 1e9; });
     pend.textContent = j.reply;
     history = j.history || history.concat([{role: 'user', content: text},
                                            {role: 'assistant', content: j.reply}]);

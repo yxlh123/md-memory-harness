@@ -226,6 +226,11 @@ PNG_1PX = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAA
 class TestImages(unittest.TestCase):
     def setUp(self):
         reset()
+        self._llm = harness.llm
+        harness.llm = lambda msgs, **kw: "- [c1] 图片对话摘要"   # 压缩时别真去联网
+
+    def tearDown(self):
+        harness.llm = self._llm
 
     def test_persist_image_writes_file_and_returns_path(self):
         rel = harness.persist_image(PNG_1PX)
@@ -542,6 +547,147 @@ class TestRanking(unittest.TestCase):
         harness.build_index()
         idx = harness.load_index()
         self.assertEqual(idx["df"]["用户"], 1, "同一条里出现三次也只算一篇文档")
+
+
+class _FakeSSEServer:
+    """本机起一个假的 /chat/completions：按要求回 SSE 或整段 JSON。"""
+
+    def __init__(self, mode="sse", pieces=("你", "好", "呀")):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        self.pieces = list(pieces)
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+                if mode == "sse":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.end_headers()
+                    for p in outer.pieces:
+                        line = json.dumps({"choices": [{"delta": {"content": p}}]}, ensure_ascii=False)
+                        self.wfile.write(b"data: " + line.encode("utf-8") + b"\n\n")
+                    self.wfile.write(b"data: [DONE]\n\n")
+                else:                       # 忽略 stream=true 的服务端
+                    body = json.dumps({"choices": [{"message": {"content": "".join(outer.pieces)}}]},
+                                      ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.srv.server_address[1]}/v1"
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *a):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class TestStreaming(unittest.TestCase):
+    def setUp(self):
+        reset()
+        self._old_url = harness.BASE_URL
+        self._old_stream = harness.llm_stream
+        self._old_key = harness.API_KEY
+        harness.API_KEY = ""
+
+    def tearDown(self):
+        harness.BASE_URL = self._old_url
+        harness.llm_stream = self._old_stream
+        harness.API_KEY = self._old_key
+
+    def test_llm_stream_parses_sse(self):
+        with _FakeSSEServer("sse", ("你", "好", "呀")) as srv:
+            harness.BASE_URL = srv.url
+            got = list(harness.llm_stream([{"role": "user", "content": "hi"}]))
+        self.assertEqual(got, ["你", "好", "呀"])
+
+    def test_llm_stream_falls_back_when_server_ignores_stream(self):
+        with _FakeSSEServer("json", ("整段", "返回")) as srv:
+            harness.BASE_URL = srv.url
+            got = list(harness.llm_stream([{"role": "user", "content": "hi"}]))
+        self.assertEqual(got, ["整段返回"])
+
+    def test_ask_stream_finishes_and_appends_history(self):
+        harness.save_memory("偏好", "喜欢短句", "user", "回答尽量短。")
+
+        def fake_stream(msgs, temperature=0.3):
+            for p in ("先给", "结论。"):
+                yield p
+
+        harness.llm_stream = fake_stream
+        harness.CFG["auto_save"] = "off"
+        sess = harness.ChatSession(budget=10000)
+        pieces = list(sess.ask_stream("怎么答"))
+        self.assertEqual("".join(pieces), "先给结论。")
+        self.assertEqual([m["role"] for m in sess.messages], ["user", "assistant"])
+        self.assertEqual(sess.messages[-1]["content"], "先给结论。")
+        answer, r = sess.last_result
+        self.assertEqual(answer, "先给结论。")
+        self.assertIn("tier", r)
+        harness.CFG["auto_save"] = "auto"
+
+    def test_stream_triggers_compaction_like_ask(self):
+        def fake_stream(msgs, temperature=0.3):
+            yield "好"
+
+        harness.llm = lambda msgs, **kw: "- [c1] 旧内容"   # 压缩摘要用
+        harness.llm_stream = fake_stream
+        harness.CFG["auto_save"] = "off"
+        sess = harness.ChatSession(budget=20, keep_recent=2)
+        for q in ("第一句话比较长一点点", "第二句话也比较长一点点", "第三句还要长一点点哦"):
+            list(sess.ask_stream(q))
+        self.assertTrue(sess.blocks, "超预算后应该压缩出块")
+        self.assertTrue(os.path.exists(harness.summary_path()))
+        harness.CFG["auto_save"] = "auto"
+
+    def test_web_chat_stream_endpoint(self):
+        """真起一个 webui 服务，验证 SSE 回包结构。"""
+        import threading
+        import urllib.request
+        import webui
+
+        def fake_stream(msgs, temperature=0.3):
+            for p in ("流", "式", "好"):
+                yield p
+
+        harness.llm_stream = fake_stream
+        harness.CFG["auto_save"] = "off"
+        srv = webui.ThreadingHTTPServer(("127.0.0.1", 0), webui.Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.server_address[1]}/api/chat_stream",
+                data=json.dumps({"message": "在吗", "history": [], "summary": "", "blocks": []}).encode("utf-8"),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self.assertIn("event-stream", r.headers.get("Content-Type", ""))
+                raw = r.read().decode("utf-8")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            harness.CFG["auto_save"] = "auto"
+        events = [json.loads(l[5:].strip()) for l in raw.splitlines() if l.startswith("data:")]
+        deltas = "".join(e["delta"] for e in events if "delta" in e)
+        self.assertEqual(deltas, "流式好")
+        done = events[-1]
+        self.assertTrue(done.get("done"))
+        self.assertEqual(done["reply"], "流式好")
+        self.assertEqual(done["history"][-1]["content"], "流式好")
 
 
 if __name__ == "__main__":

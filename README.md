@@ -26,6 +26,8 @@
 - **对话摘要压缩**：历史超过字符预算时，把较早的对话压成摘要，原文写进 `journal/c1.md`、`c2.md`…，摘要里带块号，`log show c1` 可回读全文。
 - **可换模型**：任何 OpenAI 兼容接口都行（本地 Ollama / 智谱 / DeepSeek / vLLM…）。
 - **能发图片**：命令行 `--image` / `/img`，网页端点 📎 或直接 Ctrl+V 粘贴截图。图片落盘到 `journal/images/`，上下文里只留路径标记，base64 不进 md。
+- **流式输出**：边生成边显示，不用等整段；命令行和网页都是逐字出字，压缩/记记忆在流结束后才跑。
+- **检索按词稀有度加权**：IDF 加权 + 类型/新近加成，只命中"用户"这种高频词的记忆排不到前面去。
 - **两个界面**：命令行 `harness.py`，网页 `webui.py`（标准库 `http.server`）。默认只监听本机，`--lan` 可让同一 WiFi 下的手机/平板打开，带口令保护。
 
 ## 快速开始
@@ -68,8 +70,8 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | 命令 | 作用 |
 | --- | --- |
 | `save <内容> [--type user\|feedback\|project\|reference] [--no-llm]` | 存一条记忆，默认让模型起名/写描述/判类型 |
-| `chat [--budget N] [--image 图]` | 连续对话；`/save`、`/search`、`/list`、`/history`、`/img`、`/new`、`/exit` |
-| `ask <问题> [--image 图]` | 单次问答（检索记忆后提问），可附图 |
+| `chat [--budget N] [--image 图] [--no-stream]` | 连续对话；默认逐字流式显示；`/save`、`/search`、`/list`、`/history`、`/img`、`/new`、`/exit` |
+| `ask <问题> [--image 图] [--no-stream]` | 单次问答（检索记忆后提问），可附图，默认流式 |
 | `list` | 列出全部记忆 |
 | `search <词>` | 按索引搜索，按命中率排序 |
 | `show <名字>` | 查看全文（文件名或 frontmatter 的 `name` 都认） |
@@ -79,7 +81,7 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | `rebuild` | 重建 `MEMORY.md` 和 `.index.json` |
 | `config [set <key> <value>]` | 查看/写入配置 |
 
-网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config,model}`。
+网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config,model}`；流式聊天是 `POST /api/chat_stream`（SSE）。
 
 网页端启动参数：`python webui.py [端口] [--lan] [--host IP] [--token 口令] [--no-open]`。
 
@@ -172,6 +174,16 @@ created: 2026-11-18
 5. 总量受 `retrieve_budget` 限制（默认 6000 字符），超了按分数从低往高砍。
 
 这样"记忆库很大"和"prompt 很小"就不冲突了：库多大都行，进 prompt 的永远是相关的那一小撮。
+
+## 流式输出（边生成边显示）
+
+模型不用等说完才一次性吐出来：命令行和网页都是**逐字出字**，第一个字通常在 0.3~0.8 秒内出现（整段回答可能要 2~3 秒）。
+
+- 命令行：`chat` / `ask` 默认流式；想回到整段显示加 `--no-stream`。
+- 网页：`/api/chat_stream` 用 SSE（Server-Sent Events，服务端一条条推的 HTTP 流）返回，前端用 `fetch` + `ReadableStream` 读 `data:` 行，回答框里的字是一段段长出来的。老服务端没有这个接口时，前端自动退回 `/api/chat` 一次性拿结果。
+- 协议：请求里加 `"stream": true`，返回 `data: {"choices":[{"delta":{"content":"…"}}]}` 行，最后 `data: [DONE]`。Ollama、OpenAI、智谱都是这套。
+- 服务端忽略了 `stream` 参数、直接回整段 JSON 时，`llm_stream()` 会把整段当一次增量产出，调用方不用区分。
+- **压缩和自动记记忆都在流结束后才跑**（`ChatSession.finish()`），不会插在字中间打断输出。
 
 ## 对话压缩是怎么做的
 
@@ -268,7 +280,7 @@ created: 2026-11-18
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 45 个用例，不联网
+python -m unittest discover -s tests -v     # 50 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
