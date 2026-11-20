@@ -1,6 +1,6 @@
 # 待办路线图（用户 2026-11-20 指定）
 
-> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0），见文末「已完成」。
+> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0）、#2（v2.9.0），见文末「已完成」。
 > 九项都由用户提出（#1–#4 与 #5–#9 都是 2026-11-20 一次性给的），以下是原始意图 + 落地要点。按依赖关系排序见文末。
 
 ## 1. 记忆合并 / 冲突处理（consolidate）
@@ -16,15 +16,15 @@
 2. LLM 逐簇判断：**合并 / 新覆盖旧 / 都保留**
 3. **先给建议，人工确认再执行**（不自动改库）
 
-## 2. supersede 机制（记忆的版本）
+## 2. supersede 机制（记忆的版本）—— ✅ 已完成（v2.9.0，2026-11-21）
 
-- frontmatter 增加 `status: active | superseded`
-- 增加 `supersedes: <旧条目名>`
-- 新增 `harness.py update <name> <新内容>`，自动把旧条目标 `superseded` 并写 `supersedes`
-- 检索层（`rank_entries` / `retrieve`）跳过 `superseded` 条目，但保留文件便于追溯
+- frontmatter 增加 `status: active | superseded`，以及 `supersedes` / `superseded_by` / `superseded_on`
+- 落地命令不是原计划的 `update`，而是 `save --supersedes 旧名` 与 `supersede 旧名 新内容`（外加 `restore 名字` 反悔）
+- 检索层 `rank_entries()` 跳过非 `active` 条目，`retrieve()` 自然也带不到；文件保留，`show` 可查、网页端可恢复
+- 没有 `status` 字段的老条目按 `active` 兜底（`status_of()`）；`.index.json` 升到 `INDEX_SCHEMA = 4`，条目带 `status`/`superseded_by`
+- 老名打错时只警告、不失败：新条目先落盘，`FileNotFoundError` 吞掉——保存一条记忆不该因为参数写错而整个丢掉
 
 作用：这是 #1 的地基；也顺手解决「偏好变了旧记忆阴魂不散」。
-注意：老条目没有 `status` 字段 → 迁移时按 `active` 兜底；`build_index()` 的 `_signature()` 要考虑 frontmatter 变化（mtime 已覆盖）。
 
 ## 3. 检索加权（TF-IDF 化）—— ✅ 已完成（v2.6.0，2026-11-21）
 
@@ -116,6 +116,15 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 - 用户偏好：先给结论再讲理由；英文术语要带中文解释
 
 ## 已完成
+
+### v2.9.0（2026-11-21）—— #2 supersede 机制
+
+- `save_memory(..., supersedes="")`：新条目 frontmatter 写 `supersedes`，并调 `supersede_memory()` 把旧条目降级
+- `supersede_memory(old, by)` / `restore_memory(name)` / `status_of(meta)` / `dump_memory(meta, body)` / `_set_meta(name, updates)`（值为 `None` 表示删键）
+- `rank_entries()` 跳过 `status != active`；`.index.json` 升到 `INDEX_SCHEMA = 4`，每条带 `status` / `superseded_by`
+- 命令行新增 `supersede <旧名> <新内容>`、`restore <名字>`，`save` 加 `--supersedes`；`list` 用 `⤳ 已被 X 取代` 标出来
+- 网页端：`/api/supersede`、`/api/restore`；记忆列表里旧版淡色 + `旧版` 标签 + 「恢复」按钮
+- 测试新增 `TestSupersede` 6 个（写入 supersedes、被取代的不进检索、restore 复活、索引 schema 4 带状态、旧名打错不丢新条目、网页端 supersede/restore 闭环），共 **61 个全绿**
 
 ### v2.8.0（2026-11-21）—— #5 元数据补全
 

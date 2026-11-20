@@ -69,7 +69,9 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 
 | 命令 | 作用 |
 | --- | --- |
-| `save <内容> [--type user\|feedback\|project\|reference] [--no-llm]` | 存一条记忆，默认让模型起名/写描述/判类型 |
+| `save <内容> [--type user\|feedback\|project\|reference] [--no-llm] [--supersedes 旧名]` | 存一条记忆，默认让模型起名/写描述/判类型 |
+| `supersede <旧名> <新内容> [--type T] [--no-llm]` | 存新版、把旧版标成 superseded（旧文件留着，检索不再带它） |
+| `restore <名字>` | 把 superseded 的条目恢复成 active |
 | `chat [--budget N] [--image 图] [--no-stream]` | 连续对话；默认逐字流式显示；`/save`、`/search`、`/list`、`/history`、`/img`、`/new`、`/exit` |
 | `ask <问题> [--image 图] [--no-stream]` | 单次问答（检索记忆后提问），可附图，默认流式 |
 | `list` | 列出全部记忆 |
@@ -166,6 +168,25 @@ source: 网页表单
 ```
 
 单独放一个文件，而不是写回每条 md 的 frontmatter——写 md 会改 `mtime`，索引签名一变就得整库重建，检索一次重建一次太重。`list` 和网页端的记忆列表会显示「被检索 N 次」，用来发现"存了但从来没被用上"的记忆。
+
+## 记忆改主意了怎么办（supersede）
+
+偏好是会变的："界面用深色" → "还是浅色吧"。如果两条都留在库里，检索会把**过时的偏好**和新的偏好一起塞给模型，模型照着旧的答——这比没记忆更糟。
+
+```bash
+python harness.py save "界面还是浅色护眼" --type user --supersedes 深色主题
+# 或者更直接：
+python harness.py supersede 深色主题 "界面还是浅色护眼" --type user
+```
+
+做两件事：
+
+1. 新条目写进 `memories/`，frontmatter 里记 `supersedes: 深色主题`；
+2. 旧条目改成 `status: superseded` + `superseded_by: <新条目名>` + `superseded_on: <日期>`。
+
+旧条目的**文件不删**——只是不再进检索（`rank_entries` 跳过非 `active` 的条目），`show` 还能看，网页端会显示成淡色 + `旧版` 标签，点「恢复」就重新生效（`python harness.py restore 深色主题`）。
+
+没删是因为"我当时为什么那么想"经常有用；真相是内存要干净、历史要留着，两件事分开做。
 
 ## 检索是怎么做的
 
@@ -292,7 +313,7 @@ source: 网页表单
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 55 个用例，不联网
+python -m unittest discover -s tests -v     # 61 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
@@ -300,7 +321,7 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：记忆合并/冲突处理（consolidate）、supersede 版本机制、本地 embedding 语义检索、memories 目录 git 化、网页管理面、token 用量统计。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）。
+排期见 [ROADMAP.md](ROADMAP.md)：记忆合并/冲突处理（consolidate）、supersede 版本机制、本地 embedding 语义检索、memories 目录 git 化、网页管理面、token 用量统计。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）。
 
 ## 许可
 

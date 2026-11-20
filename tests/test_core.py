@@ -733,5 +733,74 @@ class TestMeta(unittest.TestCase):
         self.assertEqual(os.stat(harness.IDX_FILE).st_mtime_ns, before, "写统计不该触发索引重建")
 
 
+class TestSupersede(unittest.TestCase):
+    """#2 记忆版本：新版存进来，旧版降级但文件保留。"""
+
+    def setUp(self):
+        reset()
+
+    def test_new_version_records_supersedes(self):
+        harness.save_memory("深色主题", "用户喜欢深色", "user", "界面要深色。")
+        name, path = harness.save_memory("浅色主题", "用户改喜欢浅色了", "user", "界面要浅色。",
+                                         supersedes="深色主题")
+        meta, _ = harness.parse_memory(harness._read_text_file(path))
+        self.assertEqual(meta["supersedes"], "深色主题")
+        self.assertEqual(harness.find_memory("深色主题")[1]["status"], "superseded")
+        self.assertEqual(harness.find_memory("深色主题")[1]["superseded_by"], name)
+        self.assertTrue(os.path.isfile(harness.find_memory("深色主题")[3]), "旧文件不该被删")
+
+    def test_superseded_entry_is_not_retrieved(self):
+        harness.save_memory("深色主题", "用户喜欢深色", "user", "界面要深色，别太白。")
+        harness.save_memory("浅色主题", "用户改喜欢浅色了", "user", "界面要浅色，护眼。",
+                            supersedes="深色主题")
+        names = harness.retrieve("深色主题")["names"]
+        self.assertNotIn("深色主题", names)
+        self.assertIn("浅色主题", names)
+
+    def test_restore_makes_it_active_again(self):
+        harness.save_memory("深色主题", "用户喜欢深色", "user", "界面要深色。")
+        harness.save_memory("浅色主题", "用户改喜欢浅色了", "user", "界面要浅色。",
+                            supersedes="深色主题")
+        harness.restore_memory("深色主题")
+        meta = harness.find_memory("深色主题")[1]
+        self.assertNotEqual(harness.status_of(meta), "superseded")
+        self.assertIn("深色主题", harness.retrieve("深色主题")["names"])
+
+    def test_index_schema_4_carries_status(self):
+        harness.save_memory("深色主题", "用户喜欢深色", "user", "界面要深色。")
+        harness.save_memory("浅色主题", "用户改喜欢浅色了", "user", "界面要浅色。",
+                            supersedes="深色主题")
+        idx = harness.load_index()
+        self.assertEqual(idx["version"], 4)
+        st = {e["name"]: e["status"] for e in idx["entries"]}
+        self.assertEqual(st["深色主题"], "superseded")
+        self.assertEqual(st["浅色主题"], "active")
+
+    def test_supersede_missing_old_does_not_lose_new(self):
+        name, _ = harness.save_memory("浅色主题", "用户改喜欢浅色了", "user", "界面要浅色。",
+                                      supersedes="并不存在")
+        self.assertTrue(os.path.isfile(harness.memory_path(name)), "旧名打错也不该把这次保存弄失败")
+
+    def test_web_supersede_and_restore(self):
+        import webui
+        harness.save_memory("深色主题", "用户喜欢深色", "user", "界面要深色。")
+        self._llm = harness.llm
+        harness.llm = lambda msgs, **kw: "浅色主题"
+        try:
+            out = webui.handle_api("/api/supersede", {"old": "深色主题",
+                                                      "text": "界面还是浅色护眼",
+                                                      "type": "user", "use_llm": False})
+        finally:
+            harness.llm = self._llm
+        self.assertNotIn("error", out, out)
+        self.assertEqual(out["superseded"], "深色主题")
+        st = {m["name"]: m["status"] for m in webui.api_state()["memories"]}
+        self.assertEqual(st["深色主题"], "superseded")
+        back = webui.handle_api("/api/restore", {"name": "深色主题"})
+        self.assertTrue(back.get("ok"), back)
+        st2 = {m["name"]: m["status"] for m in webui.api_state()["memories"]}
+        self.assertEqual(st2["深色主题"], "active")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

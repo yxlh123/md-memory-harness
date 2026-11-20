@@ -67,6 +67,8 @@
   .mem .desc { color: var(--dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chip { font-size: 11px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--dim); flex-shrink: 0; }
   .chip.user { color: #7aa2f7; } .chip.feedback { color: #e0af68; } .chip.project { color: #9ece6a; } .chip.reference { color: #bb9af7; }
+  .chip.superseded { color: #f7768e; border-style: dashed; }
+  .mem.old .name, .mem.old .desc { opacity: .5; }
   .mem .date { color: var(--dim); font-size: 12px; flex-shrink: 0; }
 
   /* 配置 */
@@ -378,13 +380,25 @@ function renderMemories() {
     .filter(m => !q || (m.name + ' ' + m.description + ' ' + m.type).toLowerCase().includes(q))
     .forEach(m => {
       const row = document.createElement('div');
-      row.className = 'mem';
+      const isOld = m.status === 'superseded';
+      row.className = 'mem' + (isOld ? ' old' : '');
       const meta = (m.uses ? ' ·被检索 ' + m.uses + ' 次' : ' ·从未被检索') +
-        (m.source ? ' ·来源：' + m.source : '') + (m.updated && m.updated !== m.created ? ' ·改于 ' + m.updated : '');
+        (m.source ? ' ·来源：' + m.source : '') + (m.updated && m.updated !== m.created ? ' ·改于 ' + m.updated : '') +
+        (isOld ? ' ·已被 ' + (m.superseded_by || '新版') + ' 取代（不进检索）' : '');
       row.innerHTML = '<span class="chip ' + m.type + '">' + m.type + '</span>' +
+        (isOld ? '<span class="chip superseded" title="' + ('已被 ' + (m.superseded_by || '新版') + ' 取代，检索不会带它').replace(/"/g, '&quot;') + '">旧版</span>' : '') +
         '<span class="name" title="' + meta.replace(/"/g, '&quot;') + '">' + m.name + '</span>' +
         '<span class="desc" title="' + m.description.replace(/"/g, '&quot;') + '">' + m.description + '</span>' +
         '<span class="date">' + m.created + '</span>';
+      if (isOld) {
+        const back = document.createElement('button');
+        back.className = 'sm'; back.textContent = '恢复';
+        back.onclick = async () => {
+          try { await api('/api/restore', {name: m.name}); state = await api('/api/state'); renderAll(); toast('已恢复 ' + m.name); }
+          catch (e) { toast('恢复失败：' + e.message); }
+        };
+        row.appendChild(back);
+      }
       const del = document.createElement('button');
       del.className = 'del'; del.textContent = '删除';
       del.onclick = async () => {

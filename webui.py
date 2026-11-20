@@ -89,7 +89,9 @@ def api_state():
                       "updated": m.get("updated", m.get("created", "")),
                       "source": m.get("source", ""),
                       "uses": int((usage.get(n) or {}).get("uses") or 0),
-                      "last_used": (usage.get(n) or {}).get("last", "")}
+                      "last_used": (usage.get(n) or {}).get("last", ""),
+                      "status": harness.status_of(m),
+                      "superseded_by": m.get("superseded_by", "")}
                      for n, m, _, _ in harness.read_all()],
         "indexed": len(idx["entries"]),
         "summary": harness.load_summary(),     # 磁盘上的压缩摘要，页面刷新后能接上
@@ -158,6 +160,28 @@ def handle_api(path, body):
         name = harness.do_save(text, mtype=body.get("type") or None,
                                use_llm=bool(body.get("use_llm", True)), source="网页表单")
         return {"name": name}
+
+    if path == "/api/supersede":
+        old = str(body.get("old") or "").strip()
+        text = str(body.get("text") or "").strip()
+        if not old or not text:
+            return api_error("旧记忆名和新内容都要填")
+        if not harness.find_memory(old):
+            return api_error(f"找不到记忆 {old}")
+        name = harness.do_save(text, mtype=body.get("type") or None,
+                               use_llm=bool(body.get("use_llm", True)),
+                               source="网页端 supersede", supersedes=old)
+        return {"name": name, "superseded": old}
+
+    if path == "/api/restore":
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return api_error("条目名为空")
+        try:
+            meta = harness.restore_memory(name)
+        except FileNotFoundError as e:
+            return api_error(str(e))
+        return {"ok": True, "name": meta.get("name", name)}
 
     if path == "/api/delete":
         name = body.get("name", "")

@@ -35,7 +35,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -134,12 +134,15 @@ TRASH_DIR = os.path.join(MEM_DIR, ".trash")
 JOURNAL_DIR = os.path.join(ROOT, "journal")          # 对话原文（摘要里的块号指向这里）
 IMG_WEIGHT = 1200                                    # 一张图折算多少字符的对话预算
 MAX_IMAGE_BYTES = 6 * 1024 * 1024                     # 单张图片上限 6MB
-INDEX_SCHEMA = 3                                      # 索引结构版本，变了就整个重建
+INDEX_SCHEMA = 4                                      # 索引结构版本，变了就整个重建
 TYPE_BOOST = {"user": 1.15, "feedback": 1.15, "project": 1.05, "reference": 0.95}
 RECENCY_HALFLIFE = 120.0                              # 新近加成的半衰期（天）
 RECENCY_WEIGHT = 0.15                                 # 最新条目最多加成 15%
 
 TYPES = ("user", "feedback", "project", "reference")
+STATUSES = ("active", "superseded")
+FM_ORDER = ("name", "description", "type", "created", "updated", "source",
+            "status", "supersedes", "superseded_by", "superseded_on")
 MEM_EXTS = (".md", ".markdown", ".txt")
 FM_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.S)
 CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
@@ -199,6 +202,50 @@ def parse_memory(text):
                 k, v = line.split(":", 1)
                 meta[k.strip()] = v.strip()
     return meta, body.strip()
+
+
+def status_of(meta):
+    """一条记忆的状态：默认 active，认识 superseded。"""
+    s = str(meta.get("status") or "active").strip().lower()
+    return s if s in STATUSES else "active"
+
+
+def dump_memory(meta, body):
+    """把 meta + 正文拼回 md。frontmatter 按 FM_ORDER 排，不认识的键跟在后面。"""
+    keys = [k for k in FM_ORDER if k in meta]
+    keys += [k for k in meta if k not in FM_ORDER and not k.startswith("_")]
+    lines = ["---"] + [f"{k}: {_one_line(meta[k], 300)}" for k in keys] + ["---", "", body.strip(), ""]
+    return "\n".join(lines)
+
+
+def _set_meta(name, updates):
+    """改写一条记忆的 frontmatter（正文不动）；值为 None 表示删掉这个键。"""
+    found = find_memory(name)
+    if not found:
+        raise FileNotFoundError(f"找不到记忆 {name}")
+    _, meta, body, path = found
+    meta.pop("_file", None)
+    for k, v in updates.items():
+        if v is None:
+            meta.pop(k, None)
+        else:
+            meta[k] = v
+    _atomic_write(path, dump_memory(meta, body))
+    rebuild_index()
+    return meta
+
+
+def supersede_memory(old, by):
+    """把旧记忆标成"已被这条取代"；检索不再带它，但文件还在、能查能恢复。"""
+    if not find_memory(old):
+        raise FileNotFoundError(f"找不到记忆 {old}")
+    return _set_meta(old, {"status": "superseded", "superseded_by": by,
+                           "superseded_on": datetime.date.today().isoformat()})
+
+
+def restore_memory(name):
+    """把 superseded 的条目恢复成 active。"""
+    return _set_meta(name, {"status": None, "superseded_by": None, "superseded_on": None})
 
 
 def _memory_files():
@@ -276,7 +323,7 @@ def _one_line(text, limit=200):
     return " ".join(str(text).split())[:limit]
 
 
-def save_memory(name, description, mtype, body, source=""):
+def save_memory(name, description, mtype, body, source="", supersedes=""):
     os.makedirs(MEM_DIR, exist_ok=True)
     name = unique_name(slugify(name))
     path = os.path.join(MEM_DIR, name + ".md")
@@ -289,8 +336,15 @@ def save_memory(name, description, mtype, body, source=""):
              f"updated: {today}\n")
     if source:
         front += f"source: {_one_line(source, 120)}\n"
+    if supersedes:
+        front += f"supersedes: {_one_line(supersedes, 80)}\n"
     front += "---\n\n"
     _atomic_write(path, front + body.strip() + "\n")
+    if supersedes:
+        try:
+            supersede_memory(supersedes, name)     # 旧的那条降级，但文件保留
+        except FileNotFoundError:
+            pass                                    # 新条目已经写好了，旧名打错不该把这次保存弄失败
     rebuild_index()
     return name, path
 
@@ -371,6 +425,8 @@ def build_index():
             "description": meta.get("description", ""),
             "type": meta.get("type", "?"),
             "created": meta.get("created", ""),
+            "status": status_of(meta),
+            "superseded_by": meta.get("superseded_by", ""),
             "head_tokens": sorted(tokenize(head)),
             "tokens": sorted(tokenize(body)),
         })
@@ -450,6 +506,8 @@ def rank_entries(question, idx=None):
     today = datetime.date.today()
     out = []
     for e in idx["entries"]:
+        if e.get("status", "active") != "active":
+            continue                       # superseded 的旧版不进检索，但仍能 show/恢复
         body = set(e.get("tokens") or [])
         head = set(e.get("head_tokens") or [])
         hit = set(known) & (body | head)   # 名字/描述也要能命中，不能只搜正文
@@ -1007,7 +1065,7 @@ class ChatSession:
 
 # ---------- 共用逻辑 ----------
 
-def do_save(text, mtype=None, use_llm=True, source="手动保存"):
+def do_save(text, mtype=None, use_llm=True, source="手动保存", supersedes=""):
     """保存一条记忆；use_llm 时让模型起名/写摘要。返回条目名。"""
     name, desc = text[:20], text[:40]
     if use_llm:
@@ -1020,7 +1078,8 @@ def do_save(text, mtype=None, use_llm=True, source="手动保存"):
                     mtype = t
             except Exception as e:
                 print(f"(LLM 加工失败，回退本地模式：{e})")
-    name, path = save_memory(name, desc, mtype or "project", text, source=source)
+    name, path = save_memory(name, desc, mtype or "project", text, source=source,
+                             supersedes=supersedes)
     print(f"已保存 {path}")
     print(f"  name: {name}\n  description: {desc}")
     return name
@@ -1061,8 +1120,10 @@ def print_memories():
     for n, m, _, _ in items:
         u = usage.get(n) or {}
         used = f"  ·被检索 {u['uses']} 次（{u.get('last', '')}）" if u.get("uses") else ""
+        gone = (f"  ⤳ 已被 {m.get('superseded_by') or '新版'} 取代"
+                if status_of(m) == "superseded" else "")
         print(f"{n}  [{m.get('type', '?')}] {m.get('description', '')}  "
-              f"({m.get('created', '?')}){used}")
+              f"({m.get('created', '?')}){used}{gone}")
     print(f"\n共 {len(items)} 条，索引：{INDEX_FILE}")
 
 
@@ -1070,7 +1131,24 @@ def print_memories():
 
 def cmd_save(a):
     do_save(" ".join(a.text).strip(), mtype=a.type, use_llm=not a.no_llm,
-            source="命令行 save")
+            source="命令行 save", supersedes=getattr(a, "supersedes", "") or "")
+
+
+def cmd_supersede(a):
+    """存一条新版，并把旧版降级（旧文件保留，检索不再带它）。"""
+    text = " ".join(a.text).strip()
+    if not text:
+        sys.exit("新内容不能为空")
+    if not find_memory(a.old):
+        sys.exit(f"找不到旧记忆 {a.old}")
+    name = do_save(text, mtype=a.type, use_llm=not a.no_llm,
+                   source="命令行 supersede", supersedes=a.old)
+    print(f"已用 {name} 取代 {a.old}（旧版仍在 memories/，可 show / restore 回看）")
+
+
+def cmd_restore(a):
+    meta = restore_memory(a.name)
+    print(f"已恢复 {meta.get('name', a.name)} 为 active")
 
 
 def cmd_list(a):
@@ -1306,7 +1384,20 @@ def main():
     p.add_argument("text", nargs="+", help="记忆内容")
     p.add_argument("--type", default="project", choices=TYPES, help="记忆类型，默认 project")
     p.add_argument("--no-llm", action="store_true", help="不调 API，纯本地保存")
+    p.add_argument("--supersedes", default="", metavar="旧名",
+                   help="这条替代哪条旧记忆（旧版会被标成 superseded，检索不再带它）")
     p.set_defaults(func=cmd_save)
+
+    p = sub.add_parser("supersede", help="存新版并降级旧版（supersede 旧名 新内容）")
+    p.add_argument("old", help="被取代的旧记忆名")
+    p.add_argument("text", nargs="+", help="新版内容")
+    p.add_argument("--type", default="project", choices=TYPES, help="记忆类型，默认 project")
+    p.add_argument("--no-llm", action="store_true", help="不调 API，纯本地保存")
+    p.set_defaults(func=cmd_supersede)
+
+    p = sub.add_parser("restore", help="把 superseded 的条目恢复成 active")
+    p.add_argument("name", help="记忆名")
+    p.set_defaults(func=cmd_restore)
 
     p = sub.add_parser("chat", help="对话模式：带记忆的连续对话（超预算自动摘要）")
     p.add_argument("--budget", type=int, default=None, help="历史字符预算，默认取配置")
