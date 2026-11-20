@@ -1,6 +1,6 @@
 # 待办路线图（用户 2026-11-20 指定）
 
-> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0）、#2（v2.9.0）、#1（v2.10.0），见文末「已完成」。
+> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0）、#2（v2.9.0）、#1（v2.10.0）、#9（v2.11.0），见文末「已完成」。
 > 九项都由用户提出（#1–#4 与 #5–#9 都是 2026-11-20 一次性给的），以下是原始意图 + 落地要点。按依赖关系排序见文末。
 
 ## 1. 记忆合并 / 冲突处理（consolidate）—— ✅ 已完成（v2.10.0，2026-11-21）
@@ -86,12 +86,12 @@ frontmatter 再加两个字段：
 - **journal 原文块**：点摘要里的 `[c1]` 能直接看那一块的原文（现在只能命令行 `log show c1`）
 - **图片库**：浏览 `journal/images/`，看历史发过的图
 
-## 9. token 用量统计
+## 9. token 用量统计 —— ✅ 已完成（v2.11.0，2026-11-21）
 
 LLM 响应里的 `usage` 字段现在被扔掉了。
 
-- 每次调用记录 `prompt_tokens` / `completion_tokens`，累计到 `journal/.usage.json`
-- 网页顶栏显示「本次 / 今日累计」
+- 每次调用记录 `prompt_tokens` / `completion_tokens`，累计到 `memories/.stats.json`（原计划 `journal/.usage.json`，落地时放到记忆目录旁边，跟 `.usage.json` 作伴）
+- 网页顶栏显示累计，回答下面显示「这一轮花了多少」
 - 接 `glm-4-flash` 这类有免费额度的模型时，心里有数
 
 ## 建议顺序
@@ -116,6 +116,17 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 - 用户偏好：先给结论再讲理由；英文术语要带中文解释
 
 ## 已完成
+
+### v2.11.0（2026-11-21）—— #9 token 用量统计
+
+- `llm()` 拿到 `usage` 不再扔：`record_usage()` 归一后累计进 `memories/.stats.json`（总量 + 按天）；`load_stats()` / `stats_totals()` 读回来
+- `_norm_usage()` 认 `prompt_tokens`/`completion_tokens` 与 `input_tokens`/`output_tokens` 两套命名，认不出就返回 `{}`（不瞎猜）
+- 流式请求带 `stream_options: {"include_usage": true}`；服务端 400 就自动退回不带它的请求——智谱实测认这个参数，最后一帧带完整 usage
+- `ChatSession.ask()` / `ask_stream()` 用**调用前后的总量差**算这一轮的花费（`_usage_delta()`），所以含回答、自动捕获判断、超预算摘要这些所有调用；结果放进 `r["usage"]` 与 `self.last_usage`
+- 命令行每轮回答后打 `· ↑350 ↓23 = 373 tokens（2 次调用）`；新增 `stats` 子命令看累计与最近 7 天
+- 网页端：`/api/chat` 与 `/api/chat_stream` 的返回里带 `usage`，回答下面补一行；header 加 `token` 徽章（悬停看按天明细）；`/api/state` 带 `stats`
+- 测试新增 `TestUsageStats` 5 个（两套字段归一化、累计与按天、`.stats.json` 不被当记忆、`ask` 回报本轮用量、stats 可读），共 **71 个全绿**
+- 实测智谱 `glm-4v-flash`：命令行 `↑147 ↓29 = 176 tokens`；网页流式一轮 `↑350 ↓23 = 373 tokens（2 次调用）`
 
 ### v2.10.0（2026-11-21）—— #1 记忆合并 / 冲突处理（consolidate）
 

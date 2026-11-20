@@ -35,7 +35,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.10.0"
+VERSION = "2.11.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -138,6 +138,7 @@ INDEX_SCHEMA = 4                                      # 索引结构版本，变
 TYPE_BOOST = {"user": 1.15, "feedback": 1.15, "project": 1.05, "reference": 0.95}
 RECENCY_HALFLIFE = 120.0                              # 新近加成的半衰期（天）
 RECENCY_WEIGHT = 0.15                                 # 最新条目最多加成 15%
+LAST_USAGE = {}                                       # 最近一次调用的用量（record_usage 填）
 
 TYPES = ("user", "feedback", "project", "reference")
 STATUSES = ("active", "superseded")
@@ -587,6 +588,83 @@ def touch_usage(names):
         pass                      # 统计写不进去不能拖累检索
 
 
+def stats_path():
+    return os.path.join(MEM_DIR, ".stats.json")
+
+
+def load_stats():
+    """token 用量：总量 + 按天的明细。{"calls":N,"prompt_tokens":N,"completion_tokens":N,"days":{...}}"""
+    try:
+        with open(stats_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("calls", 0)
+    data.setdefault("prompt_tokens", 0)
+    data.setdefault("completion_tokens", 0)
+    if not isinstance(data.get("days"), dict):
+        data["days"] = {}
+    return data
+
+
+def _norm_usage(raw):
+    """把各家不同的用量字段归一成 {prompt, completion, total}；认不出来返回 {}。"""
+    if not isinstance(raw, dict):
+        return {}
+    p = raw.get("prompt_tokens", raw.get("input_tokens", 0)) or 0
+    c = raw.get("completion_tokens", raw.get("output_tokens", 0)) or 0
+    t = raw.get("total_tokens") or 0
+    try:
+        p, c = int(p), int(c)
+        t = int(t) or (p + c)
+    except (TypeError, ValueError):
+        return {}
+    if not (p or c or t):
+        return {}
+    return {"prompt": p, "completion": c, "total": t}
+
+
+def stats_totals():
+    """(调用次数, 输入 tokens, 输出 tokens) —— 用来算"这一轮花了多少"。"""
+    d = load_stats()
+    return int(d["calls"]), int(d["prompt_tokens"]), int(d["completion_tokens"])
+
+
+def _usage_delta(before):
+    calls, prompt, completion = stats_totals()
+    p, c = prompt - before[1], completion - before[2]
+    if not (p or c):
+        return {}
+    return {"calls": calls - before[0], "prompt": p, "completion": c, "total": p + c}
+
+
+def record_usage(raw):
+    """记一次调用的 token 用量（原子写 .stats.json），并把归一化结果放进 LAST_USAGE。"""
+    u = _norm_usage(raw)
+    if not u:
+        return {}
+    data = load_stats()
+    today = datetime.date.today().isoformat()
+    day = data["days"].get(today) or {}
+    data["calls"] = int(data.get("calls") or 0) + 1
+    data["prompt_tokens"] = int(data.get("prompt_tokens") or 0) + u["prompt"]
+    data["completion_tokens"] = int(data.get("completion_tokens") or 0) + u["completion"]
+    day["calls"] = int(day.get("calls") or 0) + 1
+    day["prompt"] = int(day.get("prompt") or 0) + u["prompt"]
+    day["completion"] = int(day.get("completion") or 0) + u["completion"]
+    data["days"][today] = day
+    try:
+        os.makedirs(MEM_DIR, exist_ok=True)
+        _atomic_write(stats_path(), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    except OSError:
+        pass                      # 统计写不进去不能拖累回答
+    LAST_USAGE.clear()
+    LAST_USAGE.update(u)
+    return u
+
+
 def retrieve(question, budget_chars=None):
     """三级回退检索，返回 {text, tier, names, count}。
 
@@ -680,7 +758,17 @@ def llm(messages, temperature=0.3):
     )
     with urllib.request.urlopen(req, timeout=180) as r:
         data = json.loads(r.read().decode("utf-8"))
+    record_usage(data.get("usage"))
     return data["choices"][0]["message"]["content"]
+
+
+def _stream_body(messages, temperature, with_usage):
+    body = {"model": MODEL, "messages": messages,
+            "temperature": temperature, "stream": True}
+    if with_usage:
+        # OpenAI / 智谱都认这个开关；不认的服务端会 400，下面就退回不带它的请求
+        body["stream_options"] = {"include_usage": True}
+    return body
 
 
 def llm_stream(messages, temperature=0.3):
@@ -695,17 +783,29 @@ def llm_stream(messages, temperature=0.3):
         headers["Authorization"] = "Bearer " + API_KEY
     elif not is_local(BASE_URL):
         raise RuntimeError("未配置 API Key（MEMORY_LLM_API_KEY / config set api_key ...）")
-    req = urllib.request.Request(
-        BASE_URL + "/chat/completions",
-        data=json.dumps({"model": MODEL, "messages": messages,
-                         "temperature": temperature, "stream": True}).encode("utf-8"),
-        headers=headers,
-    )
-    with urllib.request.urlopen(req, timeout=180) as r:
+    url = BASE_URL + "/chat/completions"
+
+    def open_stream(with_usage):
+        req = urllib.request.Request(
+            url, data=json.dumps(_stream_body(messages, temperature, with_usage)).encode("utf-8"),
+            headers=headers)
+        return urllib.request.urlopen(req, timeout=180)
+
+    try:
+        resp = open_stream(True)
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            raise
+        resp = open_stream(False)          # 服务端不认识 stream_options，退回朴素请求
+
+    usage = {}
+    with resp as r:
         ctype = (r.headers.get("Content-Type") or "").lower()
         if "event-stream" not in ctype:            # 对方忽略了 stream，回的是整段 JSON
             data = json.loads(r.read().decode("utf-8"))
+            usage = data.get("usage") or {}
             yield data["choices"][0]["message"]["content"]
+            record_usage(usage)
             return
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
@@ -718,12 +818,16 @@ def llm_stream(messages, temperature=0.3):
                 obj = json.loads(chunk)
             except ValueError:
                 continue                           # 半截行/心跳，忽略
+            if obj.get("usage"):
+                usage = obj["usage"]               # 开了 include_usage 时最后一帧带用量
             choices = obj.get("choices") or []
             if not choices:
                 continue
             piece = (choices[0].get("delta") or {}).get("content")
             if piece:
                 yield piece
+    if usage:
+        record_usage(usage)
 
 
 def extract_json(text):
@@ -1168,18 +1272,28 @@ class ChatSession:
     def ask(self, question, images=None):
         """images：data URL 列表。图片落盘到 journal/images/，进 prompt 用 image_url。"""
         msgs, content, r = self.prepare(question, images)
+        before = stats_totals()
         answer = llm(msgs, temperature=0.6)
-        return answer, self.finish(question, content, answer, r)
+        self.finish(question, content, answer, r)
+        got = _usage_delta(before)      # 这轮所有模型调用（回答 + 压缩 + 判记忆）的总量
+        r["usage"] = got
+        self.last_usage = got
+        return answer, r
 
     def ask_stream(self, question, images=None):
         """流式提问：边跑边 yield 增量文本，结束把最终结果放进 self.last_result。"""
         msgs, content, r = self.prepare(question, images)
+        before = stats_totals()
         buf = []
         for piece in llm_stream(msgs, temperature=0.6):
             buf.append(piece)
             yield piece
         answer = "".join(buf)
-        self.last_result = (answer, self.finish(question, content, answer, r))
+        self.finish(question, content, answer, r)
+        got = _usage_delta(before)
+        r["usage"] = got
+        self.last_usage = got
+        self.last_result = (answer, r)
 
     def capture_memory(self, question, answer):
         """按 auto_save 配置处理"这轮有没有该记的事"：off 不猜，suggest 给候选，auto 直接存。"""
@@ -1266,7 +1380,34 @@ def print_memories():
     print(f"\n共 {len(items)} 条，索引：{INDEX_FILE}")
 
 
+def print_usage(usage=None):
+    """一行 token 用量提示；拿不到用量就什么都不打印（本地模型可能不回 usage）。"""
+    u = usage if usage is not None else LAST_USAGE
+    if not u:
+        return
+    calls = u.get("calls") or 0
+    extra = f"（{calls} 次调用）" if calls > 1 else ""
+    print(f"   · ↑{u.get('prompt', 0)} ↓{u.get('completion', 0)}"
+          f" = {u.get('total', 0)} tokens{extra}")
+
+
 # ---------- 子命令 ----------
+
+def cmd_stats(a):
+    d = load_stats()
+    if not d["calls"]:
+        print("还没有调用记录（.stats.json 里是空的）。")
+        return
+    total = d["prompt_tokens"] + d["completion_tokens"]
+    print(f"累计 {d['calls']} 次调用："
+          f"{d['prompt_tokens']} 输入 + {d['completion_tokens']} 输出 = {total} tokens")
+    days = sorted(d["days"].items())[-7:]
+    if days:
+        print("最近几天：")
+        for day, rec in days:
+            print(f"  {day}  {int(rec.get('calls') or 0)} 次  "
+                  f"{int(rec.get('prompt') or 0)}+{int(rec.get('completion') or 0)} tokens")
+    print(f"\n明细在 {stats_path()}")
 
 def cmd_save(a):
     do_save(" ".join(a.text).strip(), mtype=a.type, use_llm=not a.no_llm,
@@ -1339,14 +1480,17 @@ def cmd_ask(a):
     ]
     if getattr(a, "no_stream", False):
         print(llm(msgs))
+        print_usage()
         return
     try:
         for piece in llm_stream(msgs):          # 先流一次，失败再退回整段
             print(piece, end="", flush=True)
         print()
+        print_usage()
     except Exception as e:
         print(f"\n(流式失败，改用整段：{e})")
         print(llm(msgs))
+        print_usage()
 
 
 def cmd_chat(a):
@@ -1432,6 +1576,7 @@ def cmd_chat(a):
             continue
         if r["tier"] == "recent":
             print(f"   （记忆里没搜到相关的，只带了最近 {r['count']} 条）")
+        print_usage(r.get("usage"))
         if r.get("saved"):
             print(f"   🧠 已自动记住：{'、'.join(r['saved'])}")
         for c in r.get("suggested") or []:
@@ -1596,6 +1741,9 @@ def main():
 
     p = sub.add_parser("rebuild", help="重建 MEMORY.md 与 .index.json")
     p.set_defaults(func=cmd_rebuild)
+
+    p = sub.add_parser("stats", help="看 token 用量（次数、输入/输出、最近几天）")
+    p.set_defaults(func=cmd_stats)
 
     p = sub.add_parser("log", help="查看对话压缩留下的原文块（log show c1 回读全文）")
     p.add_argument("show", nargs="?", default=None, help="块号，如 c1；省略则列出全部")

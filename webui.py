@@ -97,6 +97,7 @@ def api_state():
         "summary": harness.load_summary(),     # 磁盘上的压缩摘要，页面刷新后能接上
         "blocks": harness.list_journal(),
         "auto_save": str(harness.CFG.get("auto_save") or "auto"),
+        "stats": harness.load_stats(),          # token 用量：总量 + 按天
     }
 
 
@@ -145,6 +146,7 @@ def handle_api(path, body):
             return api_error(f"调用模型失败：{e}")
         out = {"reply": reply, "tier": r["tier"], "used_memories": r["count"],
                "used_names": r["names"], "images": len(images),
+               "usage": r.get("usage") or {},
                "saved": r.get("saved") or [], "suggested": r.get("suggested") or []}
         out.update(sess.state())          # history / summary / blocks 回传给浏览器保存
         return out
@@ -385,6 +387,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         out = {"done": True, "reply": reply, "tier": r["tier"], "used_memories": r["count"],
                "used_names": r["names"], "images": len(images),
+               "usage": r.get("usage") or {},
                "saved": r.get("saved") or [], "suggested": r.get("suggested") or []}
         out.update(sess.state())
         emit(out)

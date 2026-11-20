@@ -90,6 +90,7 @@
   <span class="badge" id="modelbadge">…</span>
   <select id="modelsel" title="切换模型"></select>
   <span class="badge" id="memcount">…</span>
+  <span class="badge" id="tokenstat" title="累计 token 用量（点开配置页可看按天明细）">…</span>
   <nav>
     <button data-tab="chat" class="on">对话</button>
     <button data-tab="mem">记忆</button>
@@ -191,6 +192,7 @@ function renderAll() {
   $('#modelbadge').textContent = state.model + ' @ ' + state.base_url;
   renderModelSelect();
   $('#memcount').textContent = '记忆 ' + state.memories.length + ' 条';
+  renderTokenStat();
   $('#dot').className = 'dot' + ((state.is_local || state.has_key) ? '' : ' off');
   $('#cfg_base_url').value = state.base_url;
   $('#cfg_model').value = state.model;
@@ -321,6 +323,9 @@ async function send() {
       refresh();
     }
     if (j.suggested && j.suggested.length) showSuggest(pend, j.suggested);
+    if (j.usage && j.usage.total) addNote(pend, '· ↑' + j.usage.prompt + ' ↓' + j.usage.completion +
+                                          ' = ' + j.usage.total + ' tokens' +
+                                          (j.usage.calls > 1 ? '（' + j.usage.calls + ' 次调用）' : ''));
   } catch (e) {
     pend.textContent = '⚠ 调用失败：' + e.message;
   }
@@ -413,6 +418,21 @@ function renderMemories() {
   if (!list.children.length) list.innerHTML = '<div class="status">（无匹配）</div>';
 }
 $('#memsearch').addEventListener('input', renderMemories);
+/* ---------- token 用量 ---------- */
+function renderTokenStat() {
+  const s = state.stats || {};
+  const el = $('#tokenstat');
+  if (!s.calls) { el.textContent = 'token —'; el.title = '还没有调用记录'; return; }
+  const total = (s.prompt_tokens || 0) + (s.completion_tokens || 0);
+  el.textContent = 'token ' + total;
+  const days = Object.keys(s.days || {}).sort().slice(-7).map(d => {
+    const r = s.days[d] || {};
+    return d + '：' + (r.calls || 0) + ' 次，' + (r.prompt || 0) + '+' + (r.completion || 0);
+  });
+  el.title = '累计 ' + s.calls + ' 次调用：' + (s.prompt_tokens || 0) + ' 输入 + ' +
+             (s.completion_tokens || 0) + ' 输出 = ' + total + ' tokens\n' + days.join('\n');
+}
+
 /* ---------- 整理记忆（consolidate） ---------- */
 const ACTS = {merge: '合并成一条', supersede: '新版顶掉旧的', keep: '各记各的，不动'};
 $('#consolidatebtn').onclick = async () => {

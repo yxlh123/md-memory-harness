@@ -8,3 +8,4 @@ memories/.usage.json
 memories/.trash/
 .venv/
 access.log
+memories/.stats.json

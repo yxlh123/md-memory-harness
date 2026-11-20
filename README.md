@@ -81,10 +81,11 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | `delete <名字> [--purge]` | 软删除到 `.trash/`；`--purge` 彻底删 |
 | `log [c1]` | 列出对话压缩块 / 回读某块全文 |
 | `import <文件...> [--type T] [--no-llm]` | 导入 `.txt`/`.md`；UTF-8 和 GBK 都认 |
+| `stats` | 看 token 用量（累计 + 最近 7 天） |
 | `rebuild` | 重建 `MEMORY.md` 和 `.index.json` |
 | `config [set <key> <value>]` | 查看/写入配置 |
 
-网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config,model}`；流式聊天是 `POST /api/chat_stream`（SSE）。
+网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config,model,supersede,restore,consolidate}`；流式聊天是 `POST /api/chat_stream`（SSE）。
 
 网页端启动参数：`python webui.py [端口] [--lan] [--host IP] [--token 口令] [--no-open]`。
 
@@ -169,6 +170,23 @@ source: 网页表单
 ```
 
 单独放一个文件，而不是写回每条 md 的 frontmatter——写 md 会改 `mtime`，索引签名一变就得整库重建，检索一次重建一次太重。`list` 和网页端的记忆列表会显示「被检索 N 次」，用来发现"存了但从来没被用上"的记忆。
+
+## token 用量（花了多少钱）
+
+每次调用模型的 `usage` 不再扔掉，累计进 `memories/.stats.json`：
+
+```json
+{"calls": 5, "prompt_tokens": 847, "completion_tokens": 75,
+ "days": {"2026-11-21": {"calls": 5, "prompt": 847, "completion": 75}}}
+```
+
+```bash
+python harness.py stats        # 总量 + 最近 7 天按天明细
+```
+
+每轮问答结束后，命令行和网页端都会在回答下面补一行 `· ↑350 ↓23 = 373 tokens（2 次调用）`——**算的是这一轮所有模型调用的总和**，包括自动捕获记忆时那次"要不要记"的判断、以及超预算时那次摘要。所以数字常常比"一次问答"大一点，那才是真花掉的钱。
+
+流式请求会带 `stream_options: {"include_usage": true}` 让服务端在最后一帧返回用量；服务端不认这个参数（回 400）就自动退回不带它的请求，只是那样的服务商拿不到流式用量。认不出的用量字段（`input_tokens` 这类别的命名）会被 `_norm_usage()` 归一；拿不到就不显示，不瞎猜。
 
 ## 记忆改主意了怎么办（supersede）
 
@@ -333,7 +351,7 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 66 个用例，不联网
+python -m unittest discover -s tests -v     # 71 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
@@ -341,7 +359,7 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：本地 embedding 语义检索、memories 目录 git 化、网页管理面、token 用量统计。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）。
+排期见 [ROADMAP.md](ROADMAP.md)：本地 embedding 语义检索、memories 目录 git 化、网页管理面。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）。
 
 ## 许可
 

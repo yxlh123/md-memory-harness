@@ -802,6 +802,71 @@ class TestSupersede(unittest.TestCase):
         self.assertEqual(st2["深色主题"], "active")
 
 
+class TestUsageStats(unittest.TestCase):
+    """#9 token 用量：归一化各家字段 → 累计到 .stats.json → 每轮能报出来。"""
+
+    def setUp(self):
+        reset()
+        self._llm = harness.llm
+        self._auto = harness.CFG.get("auto_save")
+        harness.CFG["auto_save"] = "off"      # 只看回答那一次调用，别被自动记记忆的调用干扰
+
+    def tearDown(self):
+        harness.llm = self._llm
+        harness.LAST_USAGE.clear()
+        if self._auto is None:
+            harness.CFG.pop("auto_save", None)
+        else:
+            harness.CFG["auto_save"] = self._auto
+
+    def test_norm_usage_accepts_both_naming_styles(self):
+        self.assertEqual(harness._norm_usage({"prompt_tokens": 10, "completion_tokens": 5}),
+                         {"prompt": 10, "completion": 5, "total": 15})
+        self.assertEqual(harness._norm_usage({"input_tokens": 7, "output_tokens": 3}),
+                         {"prompt": 7, "completion": 3, "total": 10})
+        self.assertEqual(harness._norm_usage({"prompt_tokens": 4, "total_tokens": 9})["total"], 9)
+        self.assertEqual(harness._norm_usage({"foo": 1}), {})
+        self.assertEqual(harness._norm_usage(None), {})
+
+    def test_record_usage_accumulates_total_and_daily(self):
+        harness.record_usage({"prompt_tokens": 100, "completion_tokens": 20})
+        harness.record_usage({"prompt_tokens": 50, "completion_tokens": 10})
+        stats = harness.load_stats()
+        self.assertEqual(stats["calls"], 2)
+        self.assertEqual(stats["prompt_tokens"], 150)
+        self.assertEqual(stats["completion_tokens"], 30)
+        day = list(stats["days"].values())[0]
+        self.assertEqual((day["calls"], day["prompt"], day["completion"]), (2, 150, 30))
+        self.assertEqual(harness.LAST_USAGE, {"prompt": 50, "completion": 10, "total": 60})
+
+    def test_stats_file_is_not_a_memory(self):
+        harness.record_usage({"prompt_tokens": 1, "completion_tokens": 1})
+        self.assertTrue(os.path.exists(harness.stats_path()))
+        self.assertEqual(harness.read_all(), [], ".stats.json 不该被当成一条记忆")
+        harness.rebuild_index()
+        self.assertEqual(harness.load_index()["entries"], [])
+
+    def test_ask_exposes_this_turn_usage(self):
+        harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色。")
+
+        def fake(messages, **kw):
+            harness.record_usage({"prompt_tokens": 123, "completion_tokens": 45})
+            return "好的，记住了。"
+
+        harness.llm = fake
+        sess = harness.ChatSession()
+        sess.budget, sess.keep_recent = 100000, 4
+        answer, r = sess.ask("界面用什么颜色")
+        self.assertEqual(answer, "好的，记住了。")
+        self.assertEqual(r["usage"], {"calls": 1, "prompt": 123, "completion": 45, "total": 168})
+        self.assertEqual(sess.last_usage["total"], 168)
+
+    def test_web_state_carries_stats(self):
+        harness.record_usage({"prompt_tokens": 8, "completion_tokens": 2})
+        st = harness.load_stats()
+        self.assertEqual(st["calls"], 1)
+
+
 class TestConsolidate(unittest.TestCase):
     """#1 合并/冲突处理：聚类 → 模型判断 → 按决策改库。"""
 
