@@ -1243,8 +1243,12 @@ class TestManage(unittest.TestCase):
         self.assertEqual(harness.list_trash(), [])
 
     def test_restore_refuses_path_tricks(self):
-        with self.assertRaises(ValueError):
-            harness.restore_trash("..\\深色主题.md")
+        # 两种分隔符都要挡：Linux 上 "..\\x.md" 并不是带路径的名字，光看 basename 会漏
+        for bad in ("..\\深色主题.md", "../深色主题.md", "a/b.md", "..", ""):
+            with self.assertRaises(ValueError):
+                harness.restore_trash(bad)
+            with self.assertRaises(ValueError):
+                harness.purge_trash(bad)
         with self.assertRaises(FileNotFoundError):
             harness.purge_trash("不存在.md")
 

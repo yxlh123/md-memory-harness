@@ -1562,6 +1562,14 @@ def count_images(content):
 
 
 
+def _check_basename(filename):
+    """只接受纯文件名：Windows 的 \\ 和 POSIX 的 / 都要挡住（判据不能只靠 basename）。"""
+    name = str(filename or "")
+    if not name or name != os.path.basename(name) or "/" in name or "\\" in name or ".." in name:
+        raise ValueError("文件名不能带路径")
+    return name
+
+
 def list_trash():
     """回收站里的条目：[{file, name, size, mtime, preview}]，新的在前。"""
     if not os.path.isdir(TRASH_DIR):
@@ -1588,8 +1596,7 @@ def list_trash():
 
 def restore_trash(filename):
     """把回收站里的某个文件搬回 memories/（名字冲突就换个后缀），返回新名字。"""
-    if os.path.basename(filename) != filename:
-        raise ValueError("文件名不能带路径")
+    filename = _check_basename(filename)
     src = os.path.join(TRASH_DIR, filename)
     if not os.path.isfile(src):
         raise FileNotFoundError(f"回收站里没有 {filename}")
@@ -1606,8 +1613,7 @@ def restore_trash(filename):
 
 def purge_trash(filename):
     """彻底删掉回收站里的一个文件（人工决定，不可恢复）。"""
-    if os.path.basename(filename) != filename:
-        raise ValueError("文件名不能带路径")
+    filename = _check_basename(filename)
     src = os.path.join(TRASH_DIR, filename)
     if not os.path.isfile(src):
         raise FileNotFoundError(f"回收站里没有 {filename}")
