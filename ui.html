@@ -79,6 +79,16 @@
   .presets button { font-size: 12px; }
   #cfgmsg { color: var(--accent2); font-size: 13px; min-height: 18px; }
   .status { font-size: 12px; color: var(--dim); }
+  .hint { font-size: 12px; color: var(--dim); }
+  /* 开关：一个 checkbox 撑出滑块的样子，不引第三方库 */
+  .switch { position: relative; display: inline-block; width: 42px; height: 22px; flex: 0 0 auto; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider { position: absolute; inset: 0; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 99px; cursor: pointer; transition: background .15s; }
+  .switch .slider::before { content: ''; position: absolute; width: 16px; height: 16px; left: 2px; top: 2px;
+    background: var(--dim); border-radius: 50%; transition: transform .15s, background .15s; }
+  .switch input:checked + .slider { background: rgba(122, 162, 247, .25); border-color: var(--accent); }
+  .switch input:checked + .slider::before { transform: translateX(20px); background: var(--accent); }
 
   #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--accent); color: var(--text); padding: 8px 18px; border-radius: 99px; display: none; }
 </style>
@@ -155,8 +165,13 @@
         <div><label>模型 model</label><input type="text" id="cfg_model"></div>
         <div><label>API Key（本地服务可留空；已设置时不回显，留空=不修改）</label><input type="password" id="cfg_api_key" placeholder=""></div>
         <div><label>记忆目录 memory_dir</label><input type="text" id="cfg_memory_dir"></div>
-        <div><label>语义检索 embed_model（留空 = 只用关键词；本机 Ollama 可填 nomic-embed-text）</label>
-          <input type="text" id="cfg_embed_model" placeholder="留空即关闭"></div>
+        <div><label>语义检索（把文字变成向量，换个说法也搜得到；要本机有 embedding 模型）</label>
+          <div class="row">
+            <label class="switch"><input type="checkbox" id="cfg_embed_on"><span class="slider"></span></label>
+            <span id="embedstate" class="hint">关</span>
+            <input type="text" id="cfg_embed_model" placeholder="qwen3-embedding:0.6b" style="width:14em">
+          </div>
+        </div>
         <div><label>记忆自动捕获 auto_save（模型觉得该记就直接存 / 先问 / 关掉）</label>
           <select id="cfg_auto_save">
             <option value="auto">auto — 值得记的直接存进 memories/</option>
@@ -180,6 +195,7 @@ const $ = s => document.querySelector(s);
 let state = null, history = [], summary = '', blocks = [];   // summary 是压缩摘要，blocks 是已压缩块号
 // 局域网访问时服务端会给一个口令（在地址的 ?k= 里），每个请求都带上
 const KEY = new URLSearchParams(location.search).get('k') || '';
+const EMBED_DEFAULT = 'qwen3-embedding:0.6b';   // 开关打开时默认用哪个 embedding 模型（中文更强）
 
 async function api(path, body) {
   const opt = body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {headers: {}};
@@ -200,9 +216,15 @@ function renderAll() {
   $('#cfg_model').value = state.model;
   $('#cfg_auto_save').value = state.auto_save || 'auto';
   $('#cfg_embed_model').value = state.embed_model || '';
+  $('#cfg_embed_on').checked = !!state.embed_model;
+  $('#embedstate').textContent = state.embed_model
+    ? '开 · ' + state.embed_model
+    : '关（只用关键词）';
+  $('#cfg_embed_model').placeholder = EMBED_DEFAULT;
   $('#cfg_memory_dir').value = state.memory_dir;
   $('#cfgstatus').textContent = '当前：' + state.model + '  ·  ' +
-    (state.is_local ? '本地服务（免 Key）' : (state.has_key ? '云端（Key 已设置）' : '⚠ 云端但未设置 Key'));
+    (state.is_local ? '本地服务（免 Key）' : (state.has_key ? '云端（Key 已设置）' : '⚠ 云端但未设置 Key')) +
+    '  ·  语义检索：' + (state.embed_model ? state.embed_model : '关');
   renderMemories();
 }
 
@@ -225,6 +247,22 @@ $('#modelsel').onchange = async () => {
     renderModelSelect();
   }
 };
+
+/* ---------- 语义检索开关 ---------- */
+async function setEmbed(on, quiet) {
+  const name = on ? ($('#cfg_embed_model').value.trim() || EMBED_DEFAULT) : '';
+  try {
+    const j = await api('/api/config', {key: 'embed_model', value: name});
+    state = j.state;
+    renderAll();
+    if (!quiet) toast(on ? '语义检索已开启（' + name + '），记忆会重新算一遍向量' : '语义检索已关闭，回到关键词检索');
+  } catch (e) {
+    toast((on ? '开启' : '关闭') + '失败：' + e.message);
+    renderAll();                       // 失败就把开关拨回去
+  }
+}
+
+$('#cfg_embed_on').onchange = (e) => setEmbed(e.target.checked);
 
 /* ---------- 对话 ---------- */
 let attachments = [];   // 待发图片（data URL），最多 4 张
@@ -498,8 +536,12 @@ document.querySelectorAll('.presets button').forEach(b => b.onclick = () => {
 });
 $('#savecfg').onclick = async () => {
   try {
-    for (const k of ['base_url', 'model', 'memory_dir', 'auto_save', 'embed_model'])
+    for (const k of ['base_url', 'model', 'memory_dir', 'auto_save'])
       ({state} = await api('/api/config', {key: k, value: $('#' + 'cfg_' + k).value}));
+    // 语义检索由开关决定：开着就把输入框里的模型名生效，关着就写空
+    const em = $('#cfg_embed_on').checked
+      ? ($('#cfg_embed_model').value.trim() || EMBED_DEFAULT) : '';
+    ({state} = await api('/api/config', {key: 'embed_model', value: em}));
     const ak = $('#cfg_api_key').value.trim();
     if (ak) ({state} = await api('/api/config', {key: 'api_key', value: ak}));
     $('#cfg_api_key').value = '';

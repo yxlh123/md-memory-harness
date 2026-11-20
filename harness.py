@@ -36,7 +36,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.12.0"
+VERSION = "2.13.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -150,7 +150,7 @@ INDEX_SCHEMA = 5                                      # 索引结构版本，变
 TYPE_BOOST = {"user": 1.15, "feedback": 1.15, "project": 1.05, "reference": 0.95}
 RECENCY_HALFLIFE = 120.0                              # 新近加成的半衰期（天）
 RECENCY_WEIGHT = 0.15                                 # 最新条目最多加成 15%
-SEMANTIC_ONLY = 0.55                                  # 关键词一条没中时，余弦要过这个线才算命中
+SEMANTIC_ONLY = 0.45                                  # 关键词一条没中时，余弦要过这个线才算命中
 LAST_USAGE = {}                                       # 最近一次调用的用量（record_usage 填）
 
 TYPES = ("user", "feedback", "project", "reference")
@@ -399,18 +399,36 @@ def rebuild_md_index(items=None):
 
 # ---------- 检索层 ----------
 
+# 高频虚词：中文 bigram 会切出「什么」「怎么」这类，它们在特定一条记忆里 df=1，
+# IDF 会给很高权重，结果问「工作电脑装了什么模型」反而命中「文档不要客套话」。
+# 这类词不进索引，也不参与打分。
+STOPWORDS = {
+    "什么", "怎么", "这个", "那个", "一下", "可以", "我们", "你们", "他们", "自己",
+    "现在", "因为", "所以", "但是", "然后", "如果", "已经", "没有", "不是", "就是",
+    "一个", "一些", "这些", "那些", "以及", "或者", "还有", "多少", "是否", "时候",
+    "东西", "地方", "觉得", "知道", "需要", "应该", "可能", "有点", "一点", "这样",
+    "那样", "为什么", "哪里", "之后", "之前", "的话", "是不", "不一", "不要",
+    "the", "and", "for", "are", "was", "were", "you", "your", "with", "that",
+    "this", "have", "has", "not", "but", "what", "how", "why", "can", "will",
+    "from", "they", "them", "there", "here", "about", "into", "than", "then",
+    "does", "did", "doing", "been", "being", "would", "could", "should", "its",
+}
+
+
 def tokenize(text):
-    """粗分词：英文/数字按词，中文按二元组（bigram）。够本地几百条记忆用。"""
+    """粗分词：英文/数字按词，中文按二元组（bigram），去掉高频虚词。"""
     t = (text or "").lower()
     toks = set()
     for w in re.findall(r"[a-z0-9][a-z0-9_\-\.]*", t):
-        if len(w) >= 2:
+        if len(w) >= 2 and w not in STOPWORDS:
             toks.add(w)
     for run in re.findall(f"[{CJK}]+", t):
         if len(run) == 1:
-            toks.add(run)
+            if run not in STOPWORDS:
+                toks.add(run)
         else:
-            toks.update(run[i:i + 2] for i in range(len(run) - 1))
+            toks.update(g for g in (run[i:i + 2] for i in range(len(run) - 1))
+                        if g not in STOPWORDS)
     return toks
 
 

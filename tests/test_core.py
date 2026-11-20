@@ -23,6 +23,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import harness  # noqa: E402
 
 harness.JOURNAL_DIR = os.path.join(TMP, "journal")
+# 测试默认关掉语义检索：真实的 config.json 里可能开着，那会让用例依赖本机 embedding 服务
+harness.EMBED_MODEL = ""
+harness.EMBED_BASE_URL = ""
 
 
 def tearDownModule():
@@ -1041,6 +1044,18 @@ class TestSemantic(unittest.TestCase):
         self.assertTrue(os.path.exists(harness._vec_path()))
         names = [meta.get("name", stem) for stem, meta, _body, _path in harness.read_all()]
         self.assertNotIn(".vectors.json", names)
+
+    def test_stopwords_do_not_take_part_in_scoring(self):
+        """「什么/怎么」这种虚词切出来 df=1、IDF 很高，会把不相干的记忆顶上来。"""
+        today = harness.datetime.date.today().isoformat()
+        write_mem("a.md", "写作风格", "文档别客套", "feedback", today, "不要客套话")
+        write_mem("b.md", "工作环境", "本机是 Windows", "reference", today, "Windows 11 和 PowerShell")
+        harness.build_index()
+        q = harness.tokenize("工作电脑装了什么模型")
+        self.assertNotIn("什么", q, "虚词应被过滤")
+        self.assertIn("工作", q)
+        ranked = harness.rank_entries("工作电脑装了什么模型")
+        self.assertEqual(ranked[0][1]["name"], "工作环境", [e["name"] for _, e in ranked])
 
     def test_index_records_embed_model(self):
         with _FakeEmbedServer() as srv:
