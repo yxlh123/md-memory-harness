@@ -1,6 +1,6 @@
 # 待办路线图（用户 2026-11-20 指定）
 
-> 状态：**未完成项只记录、未动代码**。#3 已于 2026-11-21 落地（v2.6.0），见文末「已完成」。
+> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0），见文末「已完成」。
 > 九项都由用户提出（#1–#4 与 #5–#9 都是 2026-11-20 一次性给的），以下是原始意图 + 落地要点。按依赖关系排序见文末。
 
 ## 1. 记忆合并 / 冲突处理（consolidate）
@@ -46,17 +46,16 @@
 
 注意：`.index.json` 结构会变 → 加 `schema` 版本号，旧索引直接重建；`config.json` 增加 `embed_model`，没配就退回关键词检索。
 
-## 5. 记忆元数据补全
+## 5. 记忆元数据补全 —— ✅ 已完成（v2.8.0，2026-11-21）
 
-frontmatter 再加三个字段：
+frontmatter 再加两个字段：
 
 - `updated`：最后修改时间
-- `source`：指向产生它的 `journal` 块号（现在自动捕获的记忆**不知道出处**，没法回溯当时是怎么说的）
-- `last_used`：检索命中时顺手写回
+- `source`：这条怎么来的（`网页表单` / `命令行 save` / `chat 自动捕获` / `导入 xxx.md` / `网页端确认建议`）
 
-作用是 #1（合并判定）和 #3（时间加权）的数据基础；也让「哪条记忆从来没用过」可见——用 `last_used` 一排序就知道哪些是死条目。
+`last_used` 没写进 frontmatter，改成 `memories/.usage.json`（每条 `{"uses": N, "last": "YYYY-MM-DD"}`）——原计划里"攒批再落盘"就是因为写 md 会改 `mtime` 触发整库重建，那不如干脆不写 md。
 
-注意：`last_used` 会在检索时写文件 → 频繁写盘，建议攒批（比如同一进程内合并、或每天落一次），别每命中一次就改 mtime。
+作用是 #1（合并判定）和时间加权的数据基础；也让「哪条记忆从来没用过」可见——按 `uses` 一排序就知道哪些是死条目（`list` 与网页端都会显示）。
 
 ## 6. 流式输出（SSE）—— ✅ 已完成（v2.7.0，2026-11-21）
 
@@ -118,6 +117,13 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 
 ## 已完成
 
+### v2.8.0（2026-11-21）—— #5 元数据补全
+
+- `save_memory(...)` 多一个 `source` 参数，frontmatter 写 `updated`（当天）与 `source`（有才写）；`do_save` / `import_text` / 自动捕获 / 网页端都按场景传来源
+- 新增 `usage_path()` / `load_usage()` / `touch_usage()`：命中统计放 `memories/.usage.json`（`{"uses": N, "last": "YYYY-MM-DD"}`），**不写回 md**——写 md 会改 `mtime`，索引签名一变就整库重建
+- `retrieve()` 命中后调 `touch_usage(names)`；`list` 与网页端记忆列表显示「被检索 N 次 / 从未被检索」
+- 测试新增 `TestMeta` 5 个（`updated` 落盘、`source` 可省略、`touch_usage` 累加、`retrieve` 自动记一次、写统计不触发索引重建），共 **55 个全绿**
+
 ### v2.7.0（2026-11-21）—— #6 流式输出
 
 - `harness.py` 新增 `llm_stream(messages, temperature)`：请求带 `"stream": true`，逐行解析 `data:` 的 `choices[0].delta.content`；对方忽略 stream、直接回整段 JSON 时整段当一次产出（`Content-Type` 不是 event-stream 就走这条）
@@ -125,7 +131,7 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 - 命令行 `chat` / `ask` 默认逐字出字，加 `--no-stream` 回到整段显示；`ask` 流失败会自动退回 `llm()` 整段
 - `webui.py` 新增 `POST /api/chat_stream`（SSE：`data: {"delta":…}` … `data: {"done":true,…state}`），`do_POST` 里把请求体读取抽成 `_read_json()` 复用；无 `Content-Length`、靠关连接表示流结束
 - `ui.html` 新增 `streamChat()`（`fetch` + `ReadableStream` + `TextDecoder` 手动拼 `\n\n` 分帧），服务端没有该接口时自动退回 `/api/chat`
-- 测试新增 `TestStreaming` 5 个：真起 SSE 假服务验解析、忽略 stream 的 JSON 回退、`ask_stream` 收尾入历史、流式也触发压缩、真起 `webui` 服务验 `/api/chat_stream` 事件结构。共 **50 个全绿**
+- 测试新增 `TestStreaming` 5 个：真起 SSE 假服务验解析、忽略 stream 的 JSON 回退、`ask_stream` 收尾入历史、流式也触发压缩、真起 `webui` 服务验 `/api/chat_stream` 事件结构。当时共 **50 个全绿**
 - 实测智谱 `glm-4v-flash`：首个增量 0.43s，整段 2.37s（47 个增量）；命令行同样逐字
 
 ### v2.6.0（2026-11-21）—— #3 检索加权

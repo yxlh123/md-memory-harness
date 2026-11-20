@@ -379,8 +379,10 @@ function renderMemories() {
     .forEach(m => {
       const row = document.createElement('div');
       row.className = 'mem';
+      const meta = (m.uses ? ' ·被检索 ' + m.uses + ' 次' : ' ·从未被检索') +
+        (m.source ? ' ·来源：' + m.source : '') + (m.updated && m.updated !== m.created ? ' ·改于 ' + m.updated : '');
       row.innerHTML = '<span class="chip ' + m.type + '">' + m.type + '</span>' +
-        '<span class="name">' + m.name + '</span>' +
+        '<span class="name" title="' + meta.replace(/"/g, '&quot;') + '">' + m.name + '</span>' +
         '<span class="desc" title="' + m.description.replace(/"/g, '&quot;') + '">' + m.description + '</span>' +
         '<span class="date">' + m.created + '</span>';
       const del = document.createElement('button');

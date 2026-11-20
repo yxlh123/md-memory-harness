@@ -72,6 +72,7 @@ def lan_ips():
 
 def api_state():
     idx = harness.load_index()
+    usage = harness.load_usage()
     return {
         "version": harness.VERSION,
         "base_url": harness.BASE_URL,
@@ -84,7 +85,11 @@ def api_state():
         "history_budget": int(harness.CFG.get("history_budget") or 8000),
         "memories": [{"name": n, "type": m.get("type", "?"),
                       "description": m.get("description", ""),
-                      "created": m.get("created", "")}
+                      "created": m.get("created", ""),
+                      "updated": m.get("updated", m.get("created", "")),
+                      "source": m.get("source", ""),
+                      "uses": int((usage.get(n) or {}).get("uses") or 0),
+                      "last_used": (usage.get(n) or {}).get("last", "")}
                      for n, m, _, _ in harness.read_all()],
         "indexed": len(idx["entries"]),
         "summary": harness.load_summary(),     # 磁盘上的压缩摘要，页面刷新后能接上
@@ -146,12 +151,12 @@ def handle_api(path, body):
         text = body.get("text", "").strip()
         if body.get("name") and text:            # 前端确认"自动建议"时走这条：字段已备好，不再调模型
             name, _ = harness.save_memory(str(body["name"])[:40], str(body.get("description") or text[:40]),
-                                          body.get("type") or "project", text)
+                                          body.get("type") or "project", text, source="网页端确认建议")
             return {"name": name}
         if not text:
             return api_error("内容为空")
         name = harness.do_save(text, mtype=body.get("type") or None,
-                               use_llm=bool(body.get("use_llm", True)))
+                               use_llm=bool(body.get("use_llm", True)), source="网页表单")
         return {"name": name}
 
     if path == "/api/delete":

@@ -690,5 +690,48 @@ class TestStreaming(unittest.TestCase):
         self.assertEqual(done["history"][-1]["content"], "流式好")
 
 
+class TestMeta(unittest.TestCase):
+    """#5 元数据：updated / source / 命中统计。"""
+
+    def setUp(self):
+        reset()
+
+    def test_save_writes_updated(self):
+        _, path = harness.save_memory("深色主题", "用户偏好深色主题", "user", "喜欢深色界面。")
+        meta, _ = harness.parse_memory(harness._read_text_file(path))
+        self.assertEqual(meta["updated"], harness.datetime.date.today().isoformat())
+        self.assertEqual(meta["created"], meta["updated"])
+
+    def test_source_is_recorded_and_optional(self):
+        _, path = harness.save_memory("自动捕获", "模型自己记的", "user", "内容", source="chat 自动捕获")
+        meta, _ = harness.parse_memory(harness._read_text_file(path))
+        self.assertEqual(meta["source"], "chat 自动捕获")
+        _, path2 = harness.save_memory("手动", "没写来源", "user", "内容")
+        meta2, _ = harness.parse_memory(harness._read_text_file(path2))
+        self.assertNotIn("source", meta2)
+
+    def test_touch_usage_accumulates(self):
+        harness.save_memory("深色主题", "用户偏好深色主题", "user", "喜欢深色界面。")
+        harness.touch_usage(["深色主题"])
+        harness.touch_usage(["深色主题"])
+        u = harness.load_usage()["深色主题"]
+        self.assertEqual(u["uses"], 2)
+        self.assertEqual(u["last"], harness.datetime.date.today().isoformat())
+
+    def test_retrieve_records_usage(self):
+        harness.save_memory("深色主题", "用户偏好深色主题", "user", "界面用深色，别太白。")
+        r = harness.retrieve("深色主题")
+        self.assertIn("深色主题", r["names"])
+        self.assertEqual(harness.load_usage()["深色主题"]["uses"], 1)
+
+    def test_usage_file_does_not_invalidate_index(self):
+        harness.save_memory("深色主题", "用户偏好深色主题", "user", "喜欢深色界面。")
+        harness.load_index()
+        before = os.stat(harness.IDX_FILE).st_mtime_ns
+        harness.touch_usage(["深色主题"])           # 只写 .usage.json，不该动到 md 的 mtime
+        harness.load_index()
+        self.assertEqual(os.stat(harness.IDX_FILE).st_mtime_ns, before, "写统计不该触发索引重建")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

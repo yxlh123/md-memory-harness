@@ -146,6 +146,8 @@ name: 回答偏好
 description: 用户希望先给结论，英文术语要带中文解释
 type: user
 created: 2026-11-18
+updated: 2026-11-21
+source: 网页表单
 ---
 
 回答先给结论，再展开理由。英文术语第一次出现时带一句中文解释。
@@ -153,7 +155,17 @@ created: 2026-11-18
 
 `type` 取值：`user`（关于用户）、`feedback`（纠正/偏好）、`project`（项目里的事）、`reference`（外部资料）。
 
+`updated` 是最后修改日期；`source` 说明这条怎么来的（`网页表单` / `命令行 save` / `chat 自动捕获` / `导入 xxx.md` / `网页端确认建议`），没有就省略。
+
 `memories/MEMORY.md` 是给人看的目录，`memories/.index.json` 是给程序用的索引（都会自动重建，可以放心删）。
+
+`memories/.usage.json` 记「每条记忆被检索用过几次、最后一次是哪天」：
+
+```json
+{"回答偏好": {"uses": 12, "last": "2026-11-21"}}
+```
+
+单独放一个文件，而不是写回每条 md 的 frontmatter——写 md 会改 `mtime`，索引签名一变就得整库重建，检索一次重建一次太重。`list` 和网页端的记忆列表会显示「被检索 N 次」，用来发现"存了但从来没被用上"的记忆。
 
 ## 检索是怎么做的
 
@@ -280,7 +292,7 @@ created: 2026-11-18
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 50 个用例，不联网
+python -m unittest discover -s tests -v     # 55 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
@@ -288,7 +300,7 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：记忆合并/冲突处理（consolidate）、supersede 版本机制、TF-IDF 检索加权、本地 embedding 语义检索、记忆元数据补全、流式输出、memories 目录 git 化、网页管理面、token 用量统计。当前版本 `2.5.0` 不含这些，别按上面的说明去找这些功能。
+排期见 [ROADMAP.md](ROADMAP.md)：记忆合并/冲突处理（consolidate）、supersede 版本机制、本地 embedding 语义检索、memories 目录 git 化、网页管理面、token 用量统计。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）。
 
 ## 许可
 

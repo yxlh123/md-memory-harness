@@ -35,7 +35,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -276,16 +276,20 @@ def _one_line(text, limit=200):
     return " ".join(str(text).split())[:limit]
 
 
-def save_memory(name, description, mtype, body):
+def save_memory(name, description, mtype, body, source=""):
     os.makedirs(MEM_DIR, exist_ok=True)
     name = unique_name(slugify(name))
     path = os.path.join(MEM_DIR, name + ".md")
+    today = datetime.date.today().isoformat()
     front = ("---\n"
              f"name: {name}\n"
              f"description: {_one_line(description, 200)}\n"
              f"type: {mtype}\n"
-             f"created: {datetime.date.today().isoformat()}\n"
-             "---\n\n")
+             f"created: {today}\n"
+             f"updated: {today}\n")
+    if source:
+        front += f"source: {_one_line(source, 120)}\n"
+    front += "---\n\n"
     _atomic_write(path, front + body.strip() + "\n")
     rebuild_index()
     return name, path
@@ -489,6 +493,42 @@ def _snippet(entry, question, limit=600):
             f"{body[:limit]}")
 
 
+def usage_path():
+    return os.path.join(MEM_DIR, ".usage.json")
+
+
+def load_usage():
+    """命中统计：{条目名: {"uses": 次数, "last": "YYYY-MM-DD"}}。
+
+    单独存一个文件，而不是写回每条记忆的 frontmatter——写 md 会改 mtime，
+    索引签名一变就得整库重建，检索一下重建一次太重了。
+    """
+    try:
+        with open(usage_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def touch_usage(names):
+    """记一次"这几条被检索用上了"。调用方保证 names 非空。"""
+    if not names:
+        return
+    usage = load_usage()
+    today = datetime.date.today().isoformat()
+    for n in names:
+        rec = usage.get(n) or {"uses": 0, "last": ""}
+        rec["uses"] = int(rec.get("uses") or 0) + 1
+        rec["last"] = today
+        usage[n] = rec
+    os.makedirs(MEM_DIR, exist_ok=True)
+    try:
+        _atomic_write(usage_path(), json.dumps(usage, ensure_ascii=False, indent=2) + "\n")
+    except OSError:
+        pass                      # 统计写不进去不能拖累检索
+
+
 def retrieve(question, budget_chars=None):
     """三级回退检索，返回 {text, tier, names, count}。
 
@@ -527,7 +567,9 @@ def retrieve(question, budget_chars=None):
         "recent": "（没有检索到直接相关的记忆，以下是最近的几条，仅供参考）\n",
     }[tier]
     text = header + "\n\n".join(parts) if parts else ""
-    return {"text": text, "tier": tier, "names": [e["name"] for e in picked[:len(parts)]],
+    names = [e["name"] for e in picked[:len(parts)]]
+    touch_usage(names)
+    return {"text": text, "tier": tier, "names": names,
             "count": len(parts)}
 
 
@@ -954,7 +996,8 @@ class ChatSession:
             saved = []
             for c in cands:
                 try:
-                    save_memory(c["name"], c["description"], c["type"], c["body"])
+                    save_memory(c["name"], c["description"], c["type"], c["body"],
+                                source="chat 自动捕获")
                     saved.append(c["name"])
                 except Exception:
                     pass
@@ -964,7 +1007,7 @@ class ChatSession:
 
 # ---------- 共用逻辑 ----------
 
-def do_save(text, mtype=None, use_llm=True):
+def do_save(text, mtype=None, use_llm=True, source="手动保存"):
     """保存一条记忆；use_llm 时让模型起名/写摘要。返回条目名。"""
     name, desc = text[:20], text[:40]
     if use_llm:
@@ -977,7 +1020,7 @@ def do_save(text, mtype=None, use_llm=True):
                     mtype = t
             except Exception as e:
                 print(f"(LLM 加工失败，回退本地模式：{e})")
-    name, path = save_memory(name, desc, mtype or "project", text)
+    name, path = save_memory(name, desc, mtype or "project", text, source=source)
     print(f"已保存 {path}")
     print(f"  name: {name}\n  description: {desc}")
     return name
@@ -1003,7 +1046,7 @@ def import_text(filename, content, mtype=None, use_llm=True):
             name, desc, t = stem, body[:60], (mtype or "project")
     else:
         name, desc, t = stem, body[:60], (mtype or "project")
-    name, path = save_memory(name, desc, t, body)
+    name, path = save_memory(name, desc, t, body, source=f"导入 {os.path.basename(filename)}")
     print(f"已导入 {path}")
     print(f"  name: {name}\n  description: {desc}\n  type: {t}")
     return name
@@ -1011,18 +1054,23 @@ def import_text(filename, content, mtype=None, use_llm=True):
 
 def print_memories():
     items = read_all()
+    usage = load_usage()
     if not items:
         print("（还没有记忆，用 save 或 /save 存一条）")
         return
     for n, m, _, _ in items:
-        print(f"{n}  [{m.get('type', '?')}] {m.get('description', '')}  ({m.get('created', '?')})")
+        u = usage.get(n) or {}
+        used = f"  ·被检索 {u['uses']} 次（{u.get('last', '')}）" if u.get("uses") else ""
+        print(f"{n}  [{m.get('type', '?')}] {m.get('description', '')}  "
+              f"({m.get('created', '?')}){used}")
     print(f"\n共 {len(items)} 条，索引：{INDEX_FILE}")
 
 
 # ---------- 子命令 ----------
 
 def cmd_save(a):
-    do_save(" ".join(a.text).strip(), mtype=a.type, use_llm=not a.no_llm)
+    do_save(" ".join(a.text).strip(), mtype=a.type, use_llm=not a.no_llm,
+            source="命令行 save")
 
 
 def cmd_list(a):
