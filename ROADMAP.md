@@ -88,7 +88,7 @@ frontmatter 再加两个字段：
 
 注意：用户可能把 `memories/` 放在已有仓库里 → 先探测 `git rev-parse --show-toplevel`，是子目录就只提交该子路径；没有仓库时可选 `git init` 或干脆跳过（配置开关 `git_autocommit`）。
 
-## 8. 网页端补管理面
+## 8. 网页端补管理面 —— ✅ 已完成（v2.16.0，2026-11-21）
 
 现在网页只能聊天、看记忆列表、改配置，缺三块：
 
@@ -127,13 +127,23 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 
 ## 已完成
 
+### v2.16.0（2026-11-21）—— #8 网页管理面
+
+- `harness.py`：`list_trash()` / `restore_trash()` / `purge_trash()`、`journal_blocks()` / `journal_text()`、`list_images()`。
+- `webui.py`：GET `/api/trash`、`/api/journal[?block=c1]`、`/api/images`、`/images/<file>`、`/api/history`；POST `/api/trash`（restore/purge）、`/api/recover`。
+- `ui.html`：第四个标签「管理」，四张卡片（回收站 / 原文块 / 图片库 / 版本历史）。
+- `memgit_commit()` 首次建库时先提交一次「首次记录」，历史不会从半路开始。
+- 测试：`TestManage` 4 例（软删能捞回并重建索引、purge 才是真删、路径穿越被拒、`journal_text` 只认 `cN`），**94 个全绿**。
+- 硬约束：管理页只把已有能力搬到网页，**没有任何自动删除路径**；彻底删必须人工点两次确认。
+
+
 ### v2.15.0（2026-11-21）—— #7 记忆目录版本历史
 
 - 用户前提不变：「永久记忆不能动，除非人工剔除」——所以版本历史是**加保护**，不是加清理：删记忆只删当前文件，历史里那版还在，`recover` 能写回来
 - `memories/` 旁边一个独立 git 仓库 `.memory-history/`，`git --git-dir ... --work-tree memories` 操作，不嵌套、不影响项目仓库
 - 自动提交时机：`save_memory` / `delete_memory`（软删与 purge 分开写）/ `supersede_memory` / `restore_memory` / `memgit_restore_file`
 - CLI：`history`、`history --name`、`history --show <sha>`、`recover <sha> <名字>`；配置项 `memory_git=auto|off`
-- 90 个用例全绿（新增 `TestMemoryGit` 5 个，git 不存在时自动 skip）
+- 94 个用例全绿（新增 `TestMemoryGit` 5 个，git 不存在时自动 skip）
 
 ### v2.14.0（2026-11-21）—— 压缩掉的对话可检索 + 摘要分层
 

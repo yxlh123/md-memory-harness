@@ -38,7 +38,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.15.0"
+VERSION = "2.16.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -244,6 +244,8 @@ def memgit_commit(message):
             shutil.rmtree(memgit_path(), ignore_errors=True)   # 清掉半残的初始化
             if not _memgit_init():
                 return False
+            # 仓库刚建好：先留一个空基线提交，历史从这里开始（本次改动仍记在下面那条）
+            _memgit_run("commit", "-q", "--allow-empty", "-m", "首次记录：历史从这里开始")
         _memgit_run("add", "-A", "--", ".")
         r = _memgit_run("commit", "-q", "-m", message)
         return r.returncode == 0
@@ -1557,6 +1559,102 @@ def count_images(content):
     if not isinstance(content, list):
         return 0
     return sum(1 for p in content if isinstance(p, dict) and p.get("type") == "image_url")
+
+
+
+def list_trash():
+    """回收站里的条目：[{file, name, size, mtime, preview}]，新的在前。"""
+    if not os.path.isdir(TRASH_DIR):
+        return []
+    out = []
+    for fn in os.listdir(TRASH_DIR):
+        path = os.path.join(TRASH_DIR, fn)
+        if not os.path.isfile(path):
+            continue
+        stem, _ = os.path.splitext(fn)
+        # 文件名形如 20261121-043615-原来的名字.md
+        name = re.sub(r"^\d{8}-\d{6}-", "", stem)
+        try:
+            meta, body = parse_memory(_read_text_file(path))
+            size = os.path.getsize(path)
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            meta, body, size, mtime = {}, "", 0, ""
+        out.append({"file": fn, "name": meta.get("name") or name, "size": size,
+                    "mtime": mtime, "preview": _one_line(body, 80)})
+    out.sort(key=lambda x: x["file"], reverse=True)
+    return out
+
+
+def restore_trash(filename):
+    """把回收站里的某个文件搬回 memories/（名字冲突就换个后缀），返回新名字。"""
+    if os.path.basename(filename) != filename:
+        raise ValueError("文件名不能带路径")
+    src = os.path.join(TRASH_DIR, filename)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"回收站里没有 {filename}")
+    stem, ext = os.path.splitext(re.sub(r"^\d{8}-\d{6}-", "", filename))
+    ext = ext or ".md"
+    os.makedirs(MEM_DIR, exist_ok=True)
+    target_stem = unique_name(stem)
+    dst = os.path.join(MEM_DIR, target_stem + ext)
+    os.replace(src, dst)
+    rebuild_index()
+    memgit_commit(f"从回收站恢复 {target_stem}")
+    return target_stem
+
+
+def purge_trash(filename):
+    """彻底删掉回收站里的一个文件（人工决定，不可恢复）。"""
+    if os.path.basename(filename) != filename:
+        raise ValueError("文件名不能带路径")
+    src = os.path.join(TRASH_DIR, filename)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"回收站里没有 {filename}")
+    os.remove(src)
+    return filename
+
+
+def journal_blocks():
+    """对话原文块：[{block, chars, when}]，新的在前。"""
+    out = []
+    for block in list_journal():
+        path = _journal_path(block)
+        try:
+            text = _read_text_file(path)
+            when = datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            text, when = "", ""
+        out.append({"block": block, "chars": len(text), "when": when,
+                    "preview": _one_line(text, 60)})
+    out.sort(key=lambda x: x["block"], reverse=True)
+    return out
+
+
+def journal_text(block):
+    """读某一块的原文全文。"""
+    if not re.fullmatch(r"c\d+", str(block)):
+        raise ValueError("块号形如 c1")
+    path = _journal_path(block)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"没有原文块 {block}")
+    return _read_text_file(path)
+
+
+def list_images():
+    """图片库：[{file, size, when}]，新的在前。"""
+    d = img_dir()
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in os.listdir(d):
+        path = os.path.join(d, fn)
+        if not os.path.isfile(path):
+            continue
+        out.append({"file": fn, "size": os.path.getsize(path),
+                    "when": datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")})
+    out.sort(key=lambda x: x["file"], reverse=True)
+    return out
 
 
 def _local_summary(text, max_chars=400):

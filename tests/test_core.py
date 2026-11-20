@@ -1215,3 +1215,48 @@ class TestMemoryGit(unittest.TestCase):
         only = harness.memgit_log(10, "深色主题")
         self.assertIn("深色主题", only)
         self.assertNotIn("浅色主题", only)
+
+class TestManage(unittest.TestCase):
+    """网页「管理」页要用的几个动作：回收站、原文块。"""
+
+    def setUp(self):
+        reset()
+
+    def test_soft_deleted_memory_can_come_back(self):
+        harness.save_memory("深色主题", "偏好深色", "user", "喜欢深色界面。")
+        harness.delete_memory("深色主题")
+        self.assertIsNone(harness.find_memory("深色主题"))
+        trash = harness.list_trash()
+        self.assertEqual(len(trash), 1)
+        self.assertIn("深色主题", trash[0]["name"])
+        name = harness.restore_trash(trash[0]["file"])
+        self.assertEqual(name, "深色主题")
+        self.assertIsNotNone(harness.find_memory("深色主题"), "恢复后要能被检索到")
+        self.assertEqual(harness.list_trash(), [], "恢复后回收站里不该还留着")
+        self.assertEqual(harness.load_index()["entries"][0]["name"], "深色主题")
+
+    def test_purge_is_the_only_real_delete(self):
+        harness.save_memory("深色主题", "偏好深色", "user", "喜欢深色界面。")
+        harness.delete_memory("深色主题")
+        fn = harness.list_trash()[0]["file"]
+        harness.purge_trash(fn)
+        self.assertEqual(harness.list_trash(), [])
+
+    def test_restore_refuses_path_tricks(self):
+        with self.assertRaises(ValueError):
+            harness.restore_trash("..\\深色主题.md")
+        with self.assertRaises(FileNotFoundError):
+            harness.purge_trash("不存在.md")
+
+    def test_journal_text_only_accepts_real_blocks(self):
+        harness._journal_write("c1", "用户：原方案是 MySQL 8\n助手：好的")
+        blocks = harness.journal_blocks()
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["block"], "c1")
+        self.assertIn("MySQL 8", harness.journal_text("c1"))
+        for bad in ("c1; rm -rf", "../c1", "c", ""):
+            with self.assertRaises(ValueError):
+                harness.journal_text(bad)
+        with self.assertRaises(FileNotFoundError):
+            harness.journal_text("c99")
+

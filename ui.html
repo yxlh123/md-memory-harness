@@ -90,6 +90,17 @@
   .switch input:checked + .slider { background: rgba(122, 162, 247, .25); border-color: var(--accent); }
   .switch input:checked + .slider::before { transform: translateX(20px); background: var(--accent); }
 
+  /* 管理 */
+  .opsitem { display: flex; gap: 10px; align-items: center; padding: 8px 4px; border-top: 1px solid var(--line); }
+  .opsitem:first-child { border-top: none; }
+  .opsitem .main { flex: 1; min-width: 0; }
+  .opsitem .t { font-size: 13px; }
+  .opsitem .s { font-size: 12px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  pre.jrnl { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+    margin-top: 10px; max-height: 340px; overflow: auto; white-space: pre-wrap; font-size: 13px; }
+  .thumbs { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+  .thumbs a { display: block; width: 96px; height: 96px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); }
+  .thumbs img { width: 100%; height: 100%; object-fit: cover; display: block; }
   #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--accent); color: var(--text); padding: 8px 18px; border-radius: 99px; display: none; }
 </style>
 </head>
@@ -105,6 +116,7 @@
     <button data-tab="chat" class="on">对话</button>
     <button data-tab="mem">记忆</button>
     <button data-tab="cfg">配置</button>
+    <button data-tab="ops">管理</button>
   </nav>
 </header>
 
@@ -184,6 +196,45 @@
           <span id="cfgmsg"></span>
         </div>
         <div class="status" id="cfgstatus"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-ops">
+    <div class="pane">
+      <div class="card">
+        <div class="row" style="margin:0 0 10px">
+          <h3 style="flex:1;margin:0">回收站（删掉的记忆在这里，可以捞回来）</h3>
+          <button class="ghost" id="trashrefresh">刷新</button>
+        </div>
+        <div id="trashlist"></div>
+      </div>
+      <div class="card">
+        <div class="row" style="margin:0 0 10px">
+          <h3 style="flex:1;margin:0">对话原文块（journal/，永不删除）</h3>
+          <button class="ghost" id="jrnlrefresh">刷新</button>
+        </div>
+        <div id="jrnllist"></div>
+        <pre class="jrnl" id="jrnltext" style="display:none"></pre>
+      </div>
+      <div class="card">
+        <div class="row" style="margin:0 0 10px">
+          <h3 style="flex:1;margin:0">图片库（journal/images/）</h3>
+          <button class="ghost" id="imgrefresh">刷新</button>
+        </div>
+        <div id="imglist"></div>
+      </div>
+      <div class="card">
+        <div class="row" style="margin:0 0 10px">
+          <h3 style="flex:1;margin:0">记忆改动历史（.memory-history/）</h3>
+          <button class="ghost" id="histrefresh">刷新</button>
+        </div>
+        <pre class="jrnl" id="histlist"></pre>
+        <div class="row">
+          <input type="text" id="recsha" placeholder="提交号（如 a1b2c3d）" style="width:10em">
+          <input type="text" id="recname" placeholder="记忆名" style="width:12em">
+          <button class="ghost" id="recbtn">从这个提交恢复</button>
+        </div>
       </div>
     </div>
   </section>
@@ -551,11 +602,135 @@ $('#savecfg').onclick = async () => {
   } catch (e) { $('#cfgmsg').textContent = '✗ ' + e.message; }
 };
 
+/* ---------- 管理 ---------- */
+function opsRow(title, sub, buttons) {
+  const row = document.createElement('div');
+  row.className = 'opsitem';
+  const main = document.createElement('div');
+  main.className = 'main';
+  const t1 = document.createElement('div');
+  t1.className = 't'; t1.textContent = title;
+  const t2 = document.createElement('div');
+  t2.className = 's'; t2.textContent = sub;
+  main.append(t1, t2);
+  row.appendChild(main);
+  (buttons || []).forEach(b => row.appendChild(b));
+  return row;
+}
+function mkBtn(text, cls, fn) {
+  const b = document.createElement('button');
+  b.className = cls || 'ghost sm'; b.textContent = text;
+  b.onclick = fn;
+  return b;
+}
+function opsHint(text) {
+  const d = document.createElement('div');
+  d.className = 'hint'; d.textContent = text;
+  return d;
+}
+
+async function loadTrash() {
+  const box = $('#trashlist'); box.innerHTML = '';
+  try {
+    const j = await api('/api/trash');
+    if (!j.items.length) { box.appendChild(opsHint('回收站是空的 —— 删掉的记忆都会先躺在这里。')); return; }
+    j.items.forEach(it => {
+      box.appendChild(opsRow(it.name, it.mtime + ' · ' + it.size + ' 字节 · ' + it.preview, [
+        mkBtn('恢复', 'ghost sm', async () => {
+          try {
+            await api('/api/trash', {action: 'restore', file: it.file});
+            toast('已恢复：' + it.name); refresh(); loadTrash();
+          } catch (e) { toast('✗ ' + e.message); }
+        }),
+        mkBtn('彻底删', 'del', async () => {
+          if (!confirm('彻底删掉「' + it.name + '」？这是人工剔除，删了不可恢复。')) return;
+          try {
+            await api('/api/trash', {action: 'purge', file: it.file});
+            toast('已彻底删除'); loadTrash();
+          } catch (e) { toast('✗ ' + e.message); }
+        })
+      ]));
+    });
+  } catch (e) { box.appendChild(opsHint('读不到回收站：' + e.message)); }
+}
+
+async function loadJournal() {
+  const box = $('#jrnllist'); box.innerHTML = '';
+  $('#jrnltext').style.display = 'none';
+  try {
+    const j = await api('/api/journal');
+    if (j.summary) {
+      const d = document.createElement('div');
+      d.className = 'hint'; d.style.marginBottom = '8px';
+      d.textContent = '当前摘要（' + j.summary.split('\n').length + ' 行）：' + j.summary.split('\n')[0];
+      box.appendChild(d);
+    }
+    if (!j.items.length) { box.appendChild(opsHint('还没有压缩过的对话块。')); return; }
+    j.items.forEach(it => {
+      const row = opsRow(it.block + ' · ' + it.chars + ' 字符', it.when + ' · ' + it.preview, [
+        mkBtn('看全文', 'ghost sm', async () => {
+          try {
+            const r = await api('/api/journal?block=' + it.block);
+            const pre = $('#jrnltext');
+            pre.textContent = r.text; pre.style.display = 'block';
+            pre.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+          } catch (e) { toast('✗ ' + e.message); }
+        })
+      ]);
+      box.appendChild(row);
+    });
+  } catch (e) { box.appendChild(opsHint('读不到原文块：' + e.message)); }
+}
+
+async function loadImages() {
+  const box = $('#imglist'); box.innerHTML = '';
+  try {
+    const j = await api('/api/images');
+    if (!j.items.length) { box.appendChild(opsHint('还没有发过图片。')); return; }
+    const wrap = document.createElement('div');
+    wrap.className = 'thumbs';
+    j.items.forEach(it => {
+      const a = document.createElement('a');
+      a.href = '/images/' + encodeURIComponent(it.file) + (KEY ? '?k=' + encodeURIComponent(KEY) : '');
+      a.target = '_blank';
+      a.title = it.when + ' · ' + Math.round(it.size / 1024) + ' KB';
+      const img = document.createElement('img');
+      img.src = a.href; img.alt = it.file;
+      a.appendChild(img); wrap.appendChild(a);
+    });
+    box.appendChild(wrap);
+  } catch (e) { box.appendChild(opsHint('读不到图片库：' + e.message)); }
+}
+
+async function loadHistory() {
+  const pre = $('#histlist');
+  try {
+    const j = await api('/api/history?limit=30');
+    pre.textContent = j.enabled ? (j.log || '（还没有记录）') : '记忆版本历史关掉了（config.json 里 memory_git = off）。';
+  } catch (e) { pre.textContent = '读不到历史：' + e.message; }
+}
+
+function loadOps() { loadTrash(); loadJournal(); loadImages(); loadHistory(); }
+$('#trashrefresh').onclick = loadTrash;
+$('#jrnlrefresh').onclick = loadJournal;
+$('#imgrefresh').onclick = loadImages;
+$('#histrefresh').onclick = loadHistory;
+$('#recbtn').onclick = async () => {
+  const sha = $('#recsha').value.trim(), name = $('#recname').value.trim();
+  if (!sha || !name) { toast('提交号和记忆名都要填'); return; }
+  if (!confirm('用提交 ' + sha + ' 里的版本覆盖现在的「' + name + '」？')) return;
+  try {
+    await api('/api/recover', {sha, name});
+    toast('已从 ' + sha + ' 恢复 ' + name); refresh(); loadHistory();
+  } catch (e) { toast('✗ ' + e.message); }
+};
+
 /* ---------- 标签页 ---------- */
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.id === 'tab-' + b.dataset.tab));
   if (b.dataset.tab === 'chat') $('#msg').focus();
+  if (b.dataset.tab === 'ops') loadOps();
 });
 
 refresh = async () => {

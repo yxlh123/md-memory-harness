@@ -224,6 +224,36 @@ def handle_api(path, body):
                             for s, e in ranked[:20]],
                 "journal_text": jtext, "journal_blocks": jblocks}
 
+    if path == "/api/trash":
+        action = str(body.get("action") or "list")
+        filename = str(body.get("file") or "")
+        if action == "list":
+            return {"items": harness.list_trash()}
+        if action == "restore":
+            try:
+                name = harness.restore_trash(filename)
+            except (ValueError, FileNotFoundError) as e:
+                return api_error(str(e))
+            return {"ok": True, "name": name, "state": api_state()}
+        if action == "purge":
+            try:
+                harness.purge_trash(filename)
+            except (ValueError, FileNotFoundError) as e:
+                return api_error(str(e))
+            return {"ok": True, "items": harness.list_trash()}
+        return api_error("action 只能是 list / restore / purge")
+
+    if path == "/api/recover":
+        sha = str(body.get("sha") or "").strip()
+        name = str(body.get("name") or "").strip()
+        if not sha or not name:
+            return api_error("提交号和记忆名都要填")
+        try:
+            path_ = harness.memgit_restore_file(sha, name)
+        except ValueError as e:
+            return api_error(str(e))
+        return {"ok": True, "path": path_, "state": api_state()}
+
     if path == "/api/model":
         try:
             harness.set_model(body.get("model", ""))
@@ -299,18 +329,58 @@ class Handler(BaseHTTPRequestHandler):
                 "</body>").encode("utf-8")
         self._send(403, "text/html; charset=utf-8", html)
 
+    def _json(self, obj, code=200):
+        self._send(code, "application/json; charset=utf-8",
+                   json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _serve_image(self, name):
+        """把 journal/images/ 里的图按需发出去（管理页的图片库用）。"""
+        if os.path.basename(name) != name:
+            self._send(403, "text/plain; charset=utf-8", b"bad name")
+            return
+        path = os.path.join(harness.img_dir(), name)
+        if not os.path.isfile(path):
+            self._send(404, "text/plain; charset=utf-8", b"not found")
+            return
+        ext = os.path.splitext(name)[1].lower()
+        ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "application/octet-stream")
+        with open(path, "rb") as f:
+            self._send(200, ctype, f.read())
+
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
         path, query = parsed.path, parsed.query
         if not self._authed(query):
             self._deny(is_api=path.startswith("/api/"))
             return
+        qs = urllib.parse.parse_qs(query)
         if path in ("/", "/index.html"):
             with open(UI_FILE, encoding="utf-8") as f:
                 self._send(200, "text/html; charset=utf-8", f.read().encode("utf-8"))
         elif path == "/api/state":
-            self._send(200, "application/json; charset=utf-8",
-                       json.dumps(api_state(), ensure_ascii=False).encode("utf-8"))
+            self._json(api_state())
+        elif path == "/api/trash":
+            self._json({"items": harness.list_trash()})
+        elif path == "/api/journal":
+            block = (qs.get("block") or [""])[0]
+            if block:
+                try:
+                    self._json({"block": block, "text": harness.journal_text(block)})
+                except (ValueError, FileNotFoundError) as e:
+                    self._json(api_error(str(e)), 404)
+            else:
+                self._json({"items": harness.journal_blocks(),
+                            "summary": harness.load_summary()})
+        elif path == "/api/images":
+            self._json({"items": harness.list_images()})
+        elif path.startswith("/images/"):
+            self._serve_image(path[len("/images/"):])
+        elif path == "/api/history":
+            limit = int((qs.get("limit") or ["20"])[0])
+            name = (qs.get("name") or [""])[0]
+            self._json({"log": harness.memgit_log(limit, name),
+                        "enabled": harness.memgit_enabled()})
         elif path == "/favicon.ico":
             self._send(204, "image/x-icon", b"")
         else:

@@ -30,6 +30,7 @@
 - **流式输出**：边生成边显示，不用等整段；命令行和网页都是逐字出字，压缩/记记忆在流结束后才跑。
 - **检索按词稀有度加权**：IDF 加权 + 类型/新近加成，只命中"用户"这种高频词的记忆排不到前面去。
 - **两个界面**：命令行 `harness.py`，网页 `webui.py`（标准库 `http.server`）。默认只监听本机，`--lan` 可让同一 WiFi 下的手机/平板打开，带口令保护。
+- **网页管理页**：回收站（恢复/彻底删）、对话原文块全文、图片库、记忆改动历史与任意版本恢复，都在浏览器里点。
 - **语义检索可选，网页上一个开关**：打开就按"意思像"召回（换个说法也搜得到），关掉纯关键词；embedding 服务挂了自动退回关键词。
 
 ## 快速开始
@@ -89,7 +90,7 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | `rebuild` | 重建 `MEMORY.md` 和 `.index.json` |
 | `config [set <key> <value>]` | 查看/写入配置 |
 
-网页端接口：`GET /api/state`，`POST /api/{chat,save,search,delete,import,config,model,supersede,restore,consolidate}`；流式聊天是 `POST /api/chat_stream`（SSE）。
+网页端接口：`GET /api/state|trash|journal|images|history`、`GET /images/<文件名>`，`POST /api/{chat,chat_stream,save,search,delete,import,config,model,supersede,restore,consolidate,trash,recover}`；流式聊天是 `POST /api/chat_stream`（SSE）。
 
 网页端启动参数：`python webui.py [端口] [--lan] [--host IP] [--token 口令] [--no-open]`。
 
@@ -307,6 +308,17 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 
 也就是说：`journal/` 是聊天留下的痕迹，`memories/` 是长期知识。默认 `auto_save=auto`，模型觉得"这句话里有该长期记住的东西"就直接写进 `memories/`；不想让它自作主张就切到 `suggest`（每轮弹一句"要记吗"）或 `off`（只存你手动的）。
 
+## 网页管理页
+
+浏览器里点右上角 **管理**，四个卡片：
+
+- **回收站**：`delete` 掉的记忆都躺在这里（`memories/.trash/`），每行有「恢复」和「彻底删」。彻底删是唯一真正不可逆的操作，会再问你一次。
+- **对话原文块**：`journal/` 里所有压缩前的原话，点「看全文」直接读。这些文件**永远不会被自动删**，`--purge` 也只删 `memories/` 里的东西。
+- **图片库**：`journal/images/` 里发过的图，缩略图，点开看原图。
+- **记忆改动历史**：`.memory-history/` 的提交记录；下面填「提交号 + 记忆名」可以从任意一版恢复（等同命令行 `recover`）。
+
+管理页只是把命令行已经有的能力放到网页上，没有新增删记忆的入口——**除了你手点「彻底删」，没有任何路径会丢记忆**。
+
 ## 记忆目录的版本历史
 
 `memories/` 里每一条改动——保存、软删、supersede、恢复、从历史写回——都会在旁边的 `.memory-history/` 里提交一次，
@@ -400,7 +412,7 @@ python harness.py recover 7bc433b 深色主题   # 把那一版原样写回来�
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 90 个用例，不联网
+python -m unittest discover -s tests -v     # 94 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
@@ -408,10 +420,11 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：只剩网页管理面。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）、可选语义检索 embedding（v2.12.0）、语义检索开关 + 虚词过滤（v2.13.0）、压缩对话可检索 + 摘要分层（v2.14.0）、记忆目录版本历史（v2.15.0）。
+排期见 [ROADMAP.md](ROADMAP.md)：九项全部完成。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）、可选语义检索 embedding（v2.12.0）、语义检索开关 + 虚词过滤（v2.13.0）、压缩对话可检索 + 摘要分层（v2.14.0）、记忆目录版本历史（v2.15.0）、网页管理页（v2.16.0）。
 
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
 
 v2.0 是在一份由 AI 生成的初版基础上重写的：保留了"本地 md + 命令行 + 网页端"的骨架，重做了存储（原子写/软删除）、检索（索引/三级回退）和对话（摘要压缩/块号回读）。
+v2.16.0 补上了网页管理页：回收站、原文块、图片库、版本历史都搬进浏览器；至此 ROADMAP 九项全部落地，而记忆本身从始至终没有上限、也不存在自动删除的路径。
