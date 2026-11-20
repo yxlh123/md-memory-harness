@@ -20,6 +20,7 @@
 import argparse
 import base64
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -35,7 +36,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.11.0"
+VERSION = "2.12.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -48,6 +49,10 @@ _DEFAULTS = {
     "retrieve_budget": "6000",   # 每次带进 prompt 的记忆字符数上限
     "history_budget": "8000",    # 对话历史字符数上限，超了就把旧对话压成摘要
     "auto_save": "auto",         # 记忆自动捕获：auto 直接存 / suggest 先问一句 / off 不猜
+    "embed_model": "",           # 语义检索用的 embedding 模型（空 = 只用关键词）
+    "embed_base_url": "http://127.0.0.1:11434/v1",   # 默认走本机 Ollama
+    "embed_api_key": "",         # 云端 embedding 才需要
+    "embed_weight": "0.6",       # 语义分占多大比重（0~1，越大越偏向"意思像"）
 }
 _ENV_KEYS = {
     "base_url": "MEMORY_LLM_BASE_URL",
@@ -76,6 +81,13 @@ CFG = load_config()
 BASE_URL = CFG["base_url"].rstrip("/")
 API_KEY = CFG["api_key"] or os.environ.get("ZHIPUAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
 MODEL = CFG["model"]
+EMBED_MODEL = CFG.get("embed_model") or ""
+EMBED_BASE_URL = (CFG.get("embed_base_url") or "").rstrip("/")
+EMBED_API_KEY = CFG.get("embed_api_key") or ""
+try:
+    EMBED_WEIGHT = min(max(float(CFG.get("embed_weight") or 0.6), 0.0), 1.0)
+except ValueError:
+    EMBED_WEIGHT = 0.6
 
 
 def _norm_models(raw, current):
@@ -134,10 +146,11 @@ TRASH_DIR = os.path.join(MEM_DIR, ".trash")
 JOURNAL_DIR = os.path.join(ROOT, "journal")          # 对话原文（摘要里的块号指向这里）
 IMG_WEIGHT = 1200                                    # 一张图折算多少字符的对话预算
 MAX_IMAGE_BYTES = 6 * 1024 * 1024                     # 单张图片上限 6MB
-INDEX_SCHEMA = 4                                      # 索引结构版本，变了就整个重建
+INDEX_SCHEMA = 5                                      # 索引结构版本，变了就整个重建
 TYPE_BOOST = {"user": 1.15, "feedback": 1.15, "project": 1.05, "reference": 0.95}
 RECENCY_HALFLIFE = 120.0                              # 新近加成的半衰期（天）
 RECENCY_WEIGHT = 0.15                                 # 最新条目最多加成 15%
+SEMANTIC_ONLY = 0.55                                  # 关键词一条没中时，余弦要过这个线才算命中
 LAST_USAGE = {}                                       # 最近一次调用的用量（record_usage 填）
 
 TYPES = ("user", "feedback", "project", "reference")
@@ -414,6 +427,78 @@ def _signature():
     return sig
 
 
+def _vec_path():
+    return os.path.join(MEM_DIR, ".vectors.json")
+
+
+def _text_hash(text):
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+def load_vec_cache():
+    """向量缓存：{条目名: {"h": 文本哈希, "v": [...]}}。文本没变就不重新算，省钱。"""
+    try:
+        with open(_vec_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("model") != EMBED_MODEL:
+        return {}                       # 换了 embedding 模型，旧向量作废
+    items = data.get("items")
+    return items if isinstance(items, dict) else {}
+
+
+def save_vec_cache(items):
+    try:
+        os.makedirs(MEM_DIR, exist_ok=True)
+        _atomic_write(_vec_path(), json.dumps({"model": EMBED_MODEL, "items": items},
+                                              ensure_ascii=False))
+    except OSError:
+        pass                            # 缓存写不进去不影响检索（下次重算）
+
+
+def embed_text(text):
+    """拿一段文本的向量；没配 embed_model、或服务不通，返回 None（检索退回关键词）。"""
+    if not EMBED_MODEL or not (text or "").strip():
+        return None
+    body = {"model": EMBED_MODEL, "input": text[:4000]}
+    headers = {"Content-Type": "application/json"}
+    key = EMBED_API_KEY or (API_KEY if EMBED_BASE_URL == BASE_URL else "")
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    try:
+        req = urllib.request.Request(EMBED_BASE_URL + "/embeddings",
+                                     data=json.dumps(body).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    vec = None
+    if isinstance(data, dict):
+        arr = data.get("data")
+        if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+            vec = arr[0].get("embedding")
+        if vec is None:
+            vec = data.get("embedding")      # Ollama 原生接口的形状
+    if isinstance(vec, list) and vec:
+        try:
+            return [round(float(x), 6) for x in vec]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _cosine(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if not na or not nb:
+        return 0.0
+    return dot / (na * nb)
+
+
 def build_index():
     """重建机器索引（.index.json）。除了分词，还统计文档频率给 IDF 用。"""
     sig = _signature()
@@ -438,6 +523,24 @@ def build_index():
             df[t] = df.get(t, 0) + 1
     idx = {"version": INDEX_SCHEMA, "generated": datetime.datetime.now().isoformat(timespec="seconds"),
            "signature": sig, "n": len(entries), "df": df, "entries": entries}
+    if EMBED_MODEL:
+        # 语义向量：按内容哈希缓存，文本没改的条目不重复花钱算
+        cache = load_vec_cache()
+        fresh = {}
+        for e in entries:
+            src = f"{e['name']} {e['description']} {_entry_body(e)[:800]}"
+            h = _text_hash(src)
+            old = cache.get(e["name"])
+            if isinstance(old, dict) and old.get("h") == h and isinstance(old.get("v"), list):
+                fresh[e["name"]] = old
+            else:
+                vec = embed_text(src)
+                if vec:
+                    fresh[e["name"]] = {"h": h, "v": vec}
+            if fresh.get(e["name"]):
+                e["vec"] = fresh[e["name"]]["v"]
+        save_vec_cache(fresh)
+        idx["embed_model"] = EMBED_MODEL
     os.makedirs(MEM_DIR, exist_ok=True)
     _atomic_write(IDX_FILE, json.dumps(idx, ensure_ascii=False, indent=1))
     return idx
@@ -450,7 +553,8 @@ def load_index(force=False):
             with open(IDX_FILE, encoding="utf-8") as f:
                 idx = json.load(f)
             if (idx.get("version") == INDEX_SCHEMA and idx.get("signature") == _signature()
-                    and isinstance(idx.get("df"), dict)):
+                    and isinstance(idx.get("df"), dict)
+                    and (idx.get("embed_model") or "") == EMBED_MODEL):
                 return idx
         except Exception:
             pass
@@ -483,25 +587,26 @@ def _recency_boost(created, today=None):
 
 
 def rank_entries(question, idx=None):
-    """按 IDF 加权的相关度排序，返回 [(score, entry)]，只保留有命中的。
+    """按 IDF 加权的相关度排序，返回 [(score, entry)]，只保留命中或语义相近的。
 
-    分数 = 命中词权重 / 问题词总权重  （0~1）
-         + 整句出现在名字/描述里再补一点
-         × 类型权重（user/feedback 略高）
-         × 新近加成（最多 +15%）
+    关键词分 = 命中词权重 / 问题词总权重（生词不进分母）
+              + 整句出现在名字/描述里再补一点
+    再叠一层语义分：配了 embedding 模型时 + EMBED_WEIGHT × 余弦相似度；
+    关键词一条都没命中、但余弦足够高（≥ 0.55）的，按纯语义命中收进来。
 
     注意：名字/描述的 token 本来就计入文档，"命中名字"不再额外加权——
     否则只匹配到「用户」这种高频词的条目会盖过匹配到专有词的条目。
     """
     idx = idx or load_index()
     q = tokenize(question)
-    if not q:
+    qvec = embed_text(question) if EMBED_MODEL else None
+    if not q and not qvec:
         return []
     idf = _idf(idx)
     # 只拿「库里真有的词」当分母：问句里的生词（打错字、新词）不该稀释分数
     known = {t: idf(t) for t in q if (idx.get("df") or {}).get(t)}
     total = sum(known.values())
-    if not total:
+    if not total and not qvec:
         return []
     phrase = (question or "").strip().lower()
     today = datetime.date.today()
@@ -512,11 +617,16 @@ def rank_entries(question, idx=None):
         body = set(e.get("tokens") or [])
         head = set(e.get("head_tokens") or [])
         hit = set(known) & (body | head)   # 名字/描述也要能命中，不能只搜正文
-        if not hit:
+        cos = _cosine(qvec, e.get("vec")) if qvec else 0.0
+        if hit:
+            kw = (sum(known[t] for t in hit) / total) if total else 0.0
+            if phrase and phrase in (e.get("name", "") + e.get("description", "")).lower():
+                kw += 0.5
+            score = kw + EMBED_WEIGHT * max(cos, 0.0)
+        elif cos >= SEMANTIC_ONLY:
+            score = cos * 0.9              # 纯语义命中：词一个没对上，但意思很像
+        else:
             continue
-        score = sum(known[t] for t in hit) / total
-        if phrase and phrase in (e.get("name", "") + e.get("description", "")).lower():
-            score += 0.5
         score *= TYPE_BOOST.get(e.get("type", "?"), 1.0)
         score *= _recency_boost(e.get("created"), today)
         out.append((round(min(score, 1.5), 3), e))

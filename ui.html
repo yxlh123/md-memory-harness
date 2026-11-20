@@ -155,6 +155,8 @@
         <div><label>模型 model</label><input type="text" id="cfg_model"></div>
         <div><label>API Key（本地服务可留空；已设置时不回显，留空=不修改）</label><input type="password" id="cfg_api_key" placeholder=""></div>
         <div><label>记忆目录 memory_dir</label><input type="text" id="cfg_memory_dir"></div>
+        <div><label>语义检索 embed_model（留空 = 只用关键词；本机 Ollama 可填 nomic-embed-text）</label>
+          <input type="text" id="cfg_embed_model" placeholder="留空即关闭"></div>
         <div><label>记忆自动捕获 auto_save（模型觉得该记就直接存 / 先问 / 关掉）</label>
           <select id="cfg_auto_save">
             <option value="auto">auto — 值得记的直接存进 memories/</option>
@@ -197,6 +199,7 @@ function renderAll() {
   $('#cfg_base_url').value = state.base_url;
   $('#cfg_model').value = state.model;
   $('#cfg_auto_save').value = state.auto_save || 'auto';
+  $('#cfg_embed_model').value = state.embed_model || '';
   $('#cfg_memory_dir').value = state.memory_dir;
   $('#cfgstatus').textContent = '当前：' + state.model + '  ·  ' +
     (state.is_local ? '本地服务（免 Key）' : (state.has_key ? '云端（Key 已设置）' : '⚠ 云端但未设置 Key'));
@@ -495,7 +498,7 @@ document.querySelectorAll('.presets button').forEach(b => b.onclick = () => {
 });
 $('#savecfg').onclick = async () => {
   try {
-    for (const k of ['base_url', 'model', 'memory_dir', 'auto_save'])
+    for (const k of ['base_url', 'model', 'memory_dir', 'auto_save', 'embed_model'])
       ({state} = await api('/api/config', {key: k, value: $('#' + 'cfg_' + k).value}));
     const ak = $('#cfg_api_key').value.trim();
     if (ak) ({state} = await api('/api/config', {key: 'api_key', value: ak}));

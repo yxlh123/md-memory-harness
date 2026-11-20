@@ -1,6 +1,6 @@
 # 待办路线图（用户 2026-11-20 指定）
 
-> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0）、#2（v2.9.0）、#1（v2.10.0）、#9（v2.11.0），见文末「已完成」。
+> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0）、#2（v2.9.0）、#1（v2.10.0）、#9（v2.11.0）、#4（v2.12.0），见文末「已完成」。
 > 九项都由用户提出（#1–#4 与 #5–#9 都是 2026-11-20 一次性给的），以下是原始意图 + 落地要点。按依赖关系排序见文末。
 
 ## 1. 记忆合并 / 冲突处理（consolidate）—— ✅ 已完成（v2.10.0，2026-11-21）
@@ -36,7 +36,7 @@
 
 评价：改动最小、检索提升最直接的一项，建议先做。
 
-## 4. 语义检索（本地 embedding）
+## 4. 语义检索（本地 embedding）—— ✅ 已完成（v2.12.0，2026-11-21）
 
 二元组匹配认死词：「喜欢暗色」搜不到「深色主题偏好」。
 
@@ -127,6 +127,17 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 - 网页端：`/api/chat` 与 `/api/chat_stream` 的返回里带 `usage`，回答下面补一行；header 加 `token` 徽章（悬停看按天明细）；`/api/state` 带 `stats`
 - 测试新增 `TestUsageStats` 5 个（两套字段归一化、累计与按天、`.stats.json` 不被当记忆、`ask` 回报本轮用量、stats 可读），共 **71 个全绿**
 - 实测智谱 `glm-4v-flash`：命令行 `↑147 ↓29 = 176 tokens`；网页流式一轮 `↑350 ↓23 = 373 tokens（2 次调用）`
+
+### v2.12.0（2026-11-21）—— #4 可选语义检索（embedding）
+
+- 配置新增 `embed_model` / `embed_base_url`（默认本机 Ollama）/ `embed_api_key` / `embed_weight`（默认 0.6）；**`embed_model` 为空时行为与 v2.11.0 完全一致**
+- `embed_text(text)` 走 OpenAI 兼容的 `POST /embeddings`，同时认 `data[0].embedding` 与 Ollama 原生 `embedding`；失败一律返回 `None`（检索退回关键词，不报错）
+- `_cosine(a, b)` 纯 Python；`.index.json` 升到 `INDEX_SCHEMA = 5`，每条可带 `vec`，并记 `embed_model`（换模型就整库重算）
+- 向量缓存 `memories/.vectors.json`：按 `sha1(名字+描述+正文前 800 字)` 判断内容变没变，没变直接复用，不重复花钱
+- `rank_entries()` 改成混合打分：命中时 `关键词分 + embed_weight × max(cos, 0)`；一条关键词都没中但 `cos ≥ SEMANTIC_ONLY = 0.55` 的按纯语义命中收进来（`cos × 0.9`）
+- 网页端：`api_state()` 带 `embed_model`，设置页加「语义检索 embed_model」输入框
+- 测试新增 `TestSemantic` 5 个（无共有词也能语义召回、embedding 挂了退回关键词、向量缓存不重算、`.vectors.json` 不当记忆、索引记录模型名），共 **76 个全绿**——用本机假 `/embeddings` 服务回 3 维确定性向量，不联网、不用真下载模型
+- 现实约束：本机 Ollama 没装 embedding 模型（`ollama pull nomic-embed-text` 要下几百 MB），所以这功能默认关着，等用户愿意下模型再开
 
 ### v2.10.0（2026-11-21）—— #1 记忆合并 / 冲突处理（consolidate）
 

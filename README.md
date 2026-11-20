@@ -29,6 +29,7 @@
 - **流式输出**：边生成边显示，不用等整段；命令行和网页都是逐字出字，压缩/记记忆在流结束后才跑。
 - **检索按词稀有度加权**：IDF 加权 + 类型/新近加成，只命中"用户"这种高频词的记忆排不到前面去。
 - **两个界面**：命令行 `harness.py`，网页 `webui.py`（标准库 `http.server`）。默认只监听本机，`--lan` 可让同一 WiFi 下的手机/平板打开，带口令保护。
+- **语义检索可选**：填一个 `embed_model` 就能按"意思像"召回（换个说法也搜得到），不填就纯关键词；embedding 服务挂了自动退回关键词。
 
 ## 快速开始
 
@@ -171,6 +172,8 @@ source: 网页表单
 
 单独放一个文件，而不是写回每条 md 的 frontmatter——写 md 会改 `mtime`，索引签名一变就得整库重建，检索一次重建一次太重。`list` 和网页端的记忆列表会显示「被检索 N 次」，用来发现"存了但从来没被用上"的记忆。
 
+`memories/.vectors.json` 是语义检索的向量缓存（不填 `embed_model` 就不会生成），存 `{条目名: {h: 内容哈希, v: [向量]}}`，内容没变就不重算。
+
 ## token 用量（花了多少钱）
 
 每次调用模型的 `usage` 不再扔掉，累计进 `memories/.stats.json`：
@@ -246,6 +249,16 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 
 这样"记忆库很大"和"prompt 很小"就不冲突了：库多大都行，进 prompt 的永远是相关的那一小撮。
 
+## 语义检索（可选，默认关）
+
+关键词检索有个天生短板：**换个说法就搜不到**（记的是"界面用深色"，问"喜欢暗色吗"一个词都对不上）。配上 embedding（把文字变成一串数字的模型，意思近的向量近）就能补上这块。
+
+- 开法：`config.json` 里填 `"embed_model": "nomic-embed-text"`（本机 Ollama 先 `ollama pull nomic-embed-text`），或用智谱的 `embedding-3` 之类，配好在「设置」页填「语义检索 embed_model」也行。
+- 混合打分：关键词分 + `embed_weight`（默认 0.6）× 余弦相似度（两个向量夹角，1 = 一个方向）。关键词一条都没命中、但余弦 ≥ 0.55 的条目，按纯语义命中收进来（分数 = cos × 0.9）。
+- **向量缓存**：条目内容没变就不重算，存在 `memories/.vectors.json`（按 `sha1(名字+描述+正文前 800 字)` 判断）。换 embedding 模型时整个缓存作废重算。
+- **服务不通就自动退回关键词**：embedding 请求失败一律视作"没有语义分"，检索不会报错、也不会变慢到卡住（超时 30 秒）。
+- 代价：开语义检索后每次提问多一次 embedding 请求（约 0.1~0.3 秒、几乎不花钱）；不填 `embed_model` 就完全不受影响。
+
 ## 流式输出（边生成边显示）
 
 模型不用等说完才一次性吐出来：命令行和网页都是**逐字出字**，第一个字通常在 0.3~0.8 秒内出现（整段回答可能要 2~3 秒）。
@@ -313,6 +326,10 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 | `retrieve_budget` | — | `6000` | 每次带进 prompt 的记忆字符上限 |
 | `history_budget` | — | `8000` | 对话历史字符上限，超了压摘要 |
 | `auto_save` | — | `auto` | 记忆自动捕获：`auto` / `suggest` / `off` |
+| `embed_model` | — | 空 | 语义检索用的 embedding 模型，空 = 只用关键词 |
+| `embed_base_url` | — | `http://127.0.0.1:11434/v1` | embedding 服务地址（默认本机 Ollama） |
+| `embed_api_key` | — | 空 | 云端 embedding 才需要 |
+| `embed_weight` | — | `0.6` | 语义分占多大比重（0~1） |
 
 也可以用 `python harness.py config set model qwen3:4b` 写入 `config.json`。
 
@@ -340,7 +357,7 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 
 ## 已知局限（都是刻意的取舍）
 
-- **字面匹配，不是语义检索**：问"我喜欢什么风格"而记忆里只写"深色模式"，就搜不到，会走 `recent` 兜底。要语义得上向量库，那就不是"纯标准库单文件"了。
+- **关键词为主，语义是加分项**：不填 `embed_model` 时问"我喜欢什么风格"而记忆里只写"深色模式"，就搜不到，会走 `recent` 兜底；填了 embedding 才能补上这块。
 - **没有分词词典**：中文 bigram 对短查询够用，长句偶尔会虚高命中；IDF 只能压高频词，压不住切错的词。
 - **`api_key` 明文存在 `config.json`**：文件不进 git（`.gitignore` 已排除），但本机其他程序可读。在意的话用环境变量。
 - **单进程单用户**：没有文件锁，同时开两个 `webui.py` 写同一条记忆可能互相覆盖。
@@ -351,7 +368,7 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 71 个用例，不联网
+python -m unittest discover -s tests -v     # 76 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
@@ -359,7 +376,7 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：本地 embedding 语义检索、memories 目录 git 化、网页管理面。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）。
+排期见 [ROADMAP.md](ROADMAP.md)：memories 目录 git 化、网页管理面。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）、可选语义检索 embedding（v2.12.0）。
 
 ## 许可
 

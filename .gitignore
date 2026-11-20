@@ -9,3 +9,4 @@ memories/.trash/
 .venv/
 access.log
 memories/.stats.json
+memories/.vectors.json

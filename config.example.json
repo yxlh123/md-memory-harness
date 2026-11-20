@@ -8,5 +8,10 @@
   "api_key": "",
   "memory_dir": "",
   "retrieve_budget": "6000",
-  "history_budget": "8000"
+  "history_budget": "8000",
+  "auto_save": "auto",
+  "embed_model": "",
+  "embed_base_url": "http://127.0.0.1:11434/v1",
+  "embed_api_key": "",
+  "embed_weight": "0.6"
 }

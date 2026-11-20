@@ -97,6 +97,7 @@ def api_state():
         "summary": harness.load_summary(),     # 磁盘上的压缩摘要，页面刷新后能接上
         "blocks": harness.list_journal(),
         "auto_save": str(harness.CFG.get("auto_save") or "auto"),
+        "embed_model": harness.EMBED_MODEL,      # 空 = 只用关键词检索
         "stats": harness.load_stats(),          # token 用量：总量 + 按天
     }
 

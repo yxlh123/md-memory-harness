@@ -766,12 +766,12 @@ class TestSupersede(unittest.TestCase):
         self.assertNotEqual(harness.status_of(meta), "superseded")
         self.assertIn("深色主题", harness.retrieve("深色主题")["names"])
 
-    def test_index_schema_4_carries_status(self):
+    def test_index_schema_carries_status(self):
         harness.save_memory("深色主题", "用户喜欢深色", "user", "界面要深色。")
         harness.save_memory("浅色主题", "用户改喜欢浅色了", "user", "界面要浅色。",
                             supersedes="深色主题")
         idx = harness.load_index()
-        self.assertEqual(idx["version"], 4)
+        self.assertEqual(idx["version"], harness.INDEX_SCHEMA)
         st = {e["name"]: e["status"] for e in idx["entries"]}
         self.assertEqual(st["深色主题"], "superseded")
         self.assertEqual(st["浅色主题"], "active")
@@ -934,6 +934,122 @@ class TestConsolidate(unittest.TestCase):
         res = harness.consolidate(apply=True)
         self.assertEqual(res[0]["action"], "keep")
         self.assertIn("判不动", res[0]["reason"])
+
+
+def _fake_vec(text):
+    """3 维假向量：深色/界面、qwen/模型、会议/日程 各占一维。
+
+    这样「深色」和「暗色」余弦 = 1.0，测试不用真下载 embedding 模型。
+    """
+    groups = (("深色", "暗色", "黑色", "护眼", "界面"),
+              ("qwen", "模型", "版本", "ollama"),
+              ("会议", "日程", "时间", "安排"))
+    low = (text or "").lower()
+    vec = [float(sum(low.count(w) for w in g)) for g in groups]
+    if not any(vec):
+        vec = [0.1, 0.1, 0.1]
+    return vec
+
+
+class _FakeEmbedServer:
+    """本机假的 /embeddings 接口，回确定性向量并记录被调用了几次。"""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        self.calls = 0
+        self.texts = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0) or 0)
+                obj = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                text = str(obj.get("input", ""))
+                outer.calls += 1
+                outer.texts.append(text)
+                body = json.dumps({"data": [{"embedding": _fake_vec(text)}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.srv.server_address[1]}/v1"
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *a):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class TestSemantic(unittest.TestCase):
+    """v2.12.0 语义检索：embedding 只是加分项，没配就还是纯关键词。"""
+
+    def setUp(self):
+        reset()
+        self._old = (harness.EMBED_MODEL, harness.EMBED_BASE_URL, harness.EMBED_WEIGHT)
+        harness.EMBED_MODEL = "fake-embed"
+        harness.EMBED_WEIGHT = 0.6
+
+    def tearDown(self):
+        harness.EMBED_MODEL, harness.EMBED_BASE_URL, harness.EMBED_WEIGHT = self._old
+
+    def test_recalls_semantic_match_without_shared_words(self):
+        """「喜欢暗色」和「界面用深色」一个词都不重叠，靠向量也要能找回来。"""
+        with _FakeEmbedServer() as srv:
+            harness.EMBED_BASE_URL = srv.url
+            harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色，白色刺眼。")
+            harness.save_memory("qwen版本", "本地模型", "reference", "Ollama 里是 qwen2.5:7b。")
+            names = [e["name"] for _, e in harness.rank_entries("喜欢暗色")]
+        self.assertIn("深色主题", names, f"语义应该能召回，实际 {names}")
+        self.assertNotIn("qwen版本", names)
+
+    def test_embedding_down_falls_back_to_keywords(self):
+        harness.EMBED_BASE_URL = "http://127.0.0.1:9/v1"      # 肯定连不上
+        harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色。")
+        ranked = harness.rank_entries("深色")
+        self.assertTrue(ranked, "embedding 挂了也该能用关键词搜到")
+        self.assertEqual(ranked[0][1]["name"], "深色主题")
+
+    def test_vector_cache_avoids_recomputing(self):
+        with _FakeEmbedServer() as srv:
+            harness.EMBED_BASE_URL = srv.url
+            harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色。")
+            harness.build_index()
+            first = srv.calls
+            self.assertGreaterEqual(first, 1)
+            harness.build_index()                              # 文本没变
+            self.assertEqual(srv.calls, first, "同样的文本不该重新算向量")
+
+    def test_vectors_file_is_not_a_memory(self):
+        with _FakeEmbedServer() as srv:
+            harness.EMBED_BASE_URL = srv.url
+            harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色。")
+            harness.build_index()
+        self.assertTrue(os.path.exists(harness._vec_path()))
+        names = [meta.get("name", stem) for stem, meta, _body, _path in harness.read_all()]
+        self.assertNotIn(".vectors.json", names)
+
+    def test_index_records_embed_model(self):
+        with _FakeEmbedServer() as srv:
+            harness.EMBED_BASE_URL = srv.url
+            harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色。")
+            idx = harness.build_index()
+        self.assertEqual(idx["embed_model"], "fake-embed")
+        harness.EMBED_MODEL = "another-embed"                 # 换了模型，旧索引要重建
+        self.assertNotEqual(harness.load_index().get("embed_model"), "fake-embed")
 
 
 if __name__ == "__main__":
