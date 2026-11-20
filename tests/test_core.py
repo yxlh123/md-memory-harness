@@ -473,5 +473,76 @@ class TestAutoCapture(unittest.TestCase):
         self.assertEqual(len(names), 1, "同一条不该存两遍")
 
 
+def write_mem(fn, name, desc, mtype, created, body):
+    """直接落一条记忆，方便测排序（created 可控）。"""
+    path = os.path.join(harness.MEM_DIR, fn)
+    harness._atomic_write(path, (f"---\nname: {name}\ndescription: {desc}\n"
+                                 f"type: {mtype}\ncreated: {created}\n---\n\n{body}\n"))
+    return path
+
+
+class TestRanking(unittest.TestCase):
+    """v2.6.0 检索加权：IDF / 类型 / 新近。"""
+
+    def setUp(self):
+        reset()
+
+    def test_idf_prefers_rare_token(self):
+        """「用户」到处都有，「qwen2.5」只有一条有，后者该排前面。"""
+        today = harness.datetime.date.today().isoformat()
+        write_mem("a.md", "用户偏好", "用户界面偏好", "user", today, "用户喜欢深色界面")
+        write_mem("c.md", "用户习惯", "用户的习惯", "user", today, "用户习惯说中文")
+        write_mem("b.md", "qwen 版本", "本机模型", "reference", today, "本机跑 qwen2.5:7b")
+        harness.build_index()
+        ranked = harness.rank_entries("用户 qwen2.5")
+        names = [e["name"] for _, e in ranked]
+        self.assertEqual(names[0], "qwen 版本", f"稀有词应排第一，实际 {names}")
+        score = {e["name"]: s for s, e in ranked}
+        self.assertGreater(score["qwen 版本"], score["用户偏好"])
+
+    def test_oov_tokens_do_not_dilute(self):
+        """问句里带生词（打错字）不该把分数摊薄到 0.5 以下。"""
+        today = harness.datetime.date.today().isoformat()
+        write_mem("b.md", "qwen 版本", "本机模型", "reference", today, "本机跑 qwen2.5:7b")
+        harness.build_index()
+        ranked = harness.rank_entries("qwen2.5 生僻词汇abc")
+        self.assertTrue(ranked)
+        self.assertGreaterEqual(ranked[0][0], 0.9, "生词应被忽略，不该稀释分母")
+
+    def test_recency_boost_breaks_ties(self):
+        old = (harness.datetime.date.today() - harness.datetime.timedelta(days=400)).isoformat()
+        today = harness.datetime.date.today().isoformat()
+        write_mem("old.md", "老条目", "同一件事", "user", old, "同一个内容")
+        write_mem("new.md", "新条目", "同一件事", "user", today, "同一个内容")
+        harness.build_index()
+        ranked = harness.rank_entries("同一个内容")
+        self.assertEqual([e["name"] for _, e in ranked][0], "新条目")
+
+    def test_type_boost_prefers_user(self):
+        today = harness.datetime.date.today().isoformat()
+        write_mem("r.md", "参考资料", "同一件事", "reference", today, "同样的正文内容")
+        write_mem("u.md", "本人偏好", "同一件事", "user", today, "同样的正文内容")
+        harness.build_index()
+        ranked = harness.rank_entries("同样的正文内容")
+        self.assertEqual([e["name"] for _, e in ranked][0], "本人偏好")
+
+    def test_old_index_schema_rebuilds(self):
+        write_mem("a.md", "某条", "说明", "user", "2026-01-01", "正文")
+        harness._atomic_write(harness.IDX_FILE, json.dumps(
+            {"version": 2, "signature": [], "entries": []}, ensure_ascii=False))
+        idx = harness.load_index()
+        self.assertEqual(idx["version"], harness.INDEX_SCHEMA)
+        self.assertIn("df", idx)
+        self.assertEqual(idx["n"], 1)
+
+    def test_df_counts_documents_not_occurrences(self):
+        today = harness.datetime.date.today().isoformat()
+        write_mem("a.md", "甲", "说明", "user", today, "用户 用户 用户 都出现")
+        write_mem("b.md", "乙", "说明", "user", today, "别的词")
+        harness.build_index()
+        idx = harness.load_index()
+        self.assertEqual(idx["df"]["用户"], 1, "同一条里出现三次也只算一篇文档")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -21,6 +21,7 @@ import argparse
 import base64
 import datetime
 import json
+import math
 import os
 import re
 import sys
@@ -34,7 +35,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -133,6 +134,10 @@ TRASH_DIR = os.path.join(MEM_DIR, ".trash")
 JOURNAL_DIR = os.path.join(ROOT, "journal")          # 对话原文（摘要里的块号指向这里）
 IMG_WEIGHT = 1200                                    # 一张图折算多少字符的对话预算
 MAX_IMAGE_BYTES = 6 * 1024 * 1024                     # 单张图片上限 6MB
+INDEX_SCHEMA = 3                                      # 索引结构版本，变了就整个重建
+TYPE_BOOST = {"user": 1.15, "feedback": 1.15, "project": 1.05, "reference": 0.95}
+RECENCY_HALFLIFE = 120.0                              # 新近加成的半衰期（天）
+RECENCY_WEIGHT = 0.15                                 # 最新条目最多加成 15%
 
 TYPES = ("user", "feedback", "project", "reference")
 MEM_EXTS = (".md", ".markdown", ".txt")
@@ -351,7 +356,7 @@ def _signature():
 
 
 def build_index():
-    """重建机器索引（.index.json）。"""
+    """重建机器索引（.index.json）。除了分词，还统计文档频率给 IDF 用。"""
     sig = _signature()
     entries = []
     for stem, meta, body, path in read_all():
@@ -365,45 +370,92 @@ def build_index():
             "head_tokens": sorted(tokenize(head)),
             "tokens": sorted(tokenize(body)),
         })
-    idx = {"version": 2, "generated": datetime.datetime.now().isoformat(timespec="seconds"),
-           "signature": sig, "entries": entries}
+    # 文档频率：每个 token 出现在多少条记忆里（判断「这个词是不是到处都有」）
+    df = {}
+    for e in entries:
+        for t in set(e["tokens"]) | set(e["head_tokens"]):
+            df[t] = df.get(t, 0) + 1
+    idx = {"version": INDEX_SCHEMA, "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+           "signature": sig, "n": len(entries), "df": df, "entries": entries}
     os.makedirs(MEM_DIR, exist_ok=True)
     _atomic_write(IDX_FILE, json.dumps(idx, ensure_ascii=False, indent=1))
     return idx
 
 
 def load_index(force=False):
-    """读索引；过期或不存在就重建。"""
+    """读索引；过期、不存在或结构版本不对就重建。"""
     if not force and os.path.exists(IDX_FILE):
         try:
             with open(IDX_FILE, encoding="utf-8") as f:
                 idx = json.load(f)
-            if idx.get("version") == 2 and idx.get("signature") == _signature():
+            if (idx.get("version") == INDEX_SCHEMA and idx.get("signature") == _signature()
+                    and isinstance(idx.get("df"), dict)):
                 return idx
         except Exception:
             pass
     return build_index()
 
 
+def _idf(idx):
+    """IDF 权重：doc-freq 越低的词越值钱。
+
+    「用户喜欢」这种到处都有的 bigram 权重被压下去，
+    「qwen2.5」这种只出现在一条记忆里的词权重高。零依赖，纯统计。
+    """
+    n = max(int(idx.get("n") or 0), 1)
+    df = idx.get("df") or {}
+
+    def weight(token):
+        return math.log(1.0 + (n + 0.5) / (df.get(token, 0) + 0.5))
+
+    return weight
+
+
+def _recency_boost(created, today=None):
+    """新近加成：刚存的记忆略占优，老条目慢慢回到 1.0（不会过期）。"""
+    try:
+        d = datetime.date.fromisoformat(str(created or "")[:10])
+    except ValueError:
+        return 1.0
+    days = max(((today or datetime.date.today()) - d).days, 0)
+    return 1.0 + RECENCY_WEIGHT * math.exp(-days / RECENCY_HALFLIFE)
+
+
 def rank_entries(question, idx=None):
-    """按命中率排序，返回 [(score, entry)]，只保留有命中的。"""
+    """按 IDF 加权的相关度排序，返回 [(score, entry)]，只保留有命中的。
+
+    分数 = 命中词权重 / 问题词总权重  （0~1）
+         + 整句出现在名字/描述里再补一点
+         × 类型权重（user/feedback 略高）
+         × 新近加成（最多 +15%）
+
+    注意：名字/描述的 token 本来就计入文档，"命中名字"不再额外加权——
+    否则只匹配到「用户」这种高频词的条目会盖过匹配到专有词的条目。
+    """
     idx = idx or load_index()
     q = tokenize(question)
     if not q:
         return []
+    idf = _idf(idx)
+    # 只拿「库里真有的词」当分母：问句里的生词（打错字、新词）不该稀释分数
+    known = {t: idf(t) for t in q if (idx.get("df") or {}).get(t)}
+    total = sum(known.values())
+    if not total:
+        return []
     phrase = (question or "").strip().lower()
+    today = datetime.date.today()
     out = []
     for e in idx["entries"]:
         body = set(e.get("tokens") or [])
         head = set(e.get("head_tokens") or [])
-        hit = q & (body | head)   # 名字/描述也要能命中，不能只搜正文
+        hit = set(known) & (body | head)   # 名字/描述也要能命中，不能只搜正文
         if not hit:
             continue
-        score = len(hit) / len(q)
-        if q & head:
-            score += 0.5 * len(q & head) / len(q)
+        score = sum(known[t] for t in hit) / total
         if phrase and phrase in (e.get("name", "") + e.get("description", "")).lower():
             score += 0.5
+        score *= TYPE_BOOST.get(e.get("type", "?"), 1.0)
+        score *= _recency_boost(e.get("created"), today)
         out.append((round(min(score, 1.5), 3), e))
     out.sort(key=lambda x: x[0], reverse=True)
     return out
