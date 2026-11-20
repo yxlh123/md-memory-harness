@@ -161,6 +161,11 @@ def handle_api(path, body):
                                use_llm=bool(body.get("use_llm", True)), source="网页表单")
         return {"name": name}
 
+    if path == "/api/consolidate":
+        res = harness.consolidate(apply=bool(body.get("apply")),
+                                  threshold=float(body.get("threshold") or 0.3))
+        return {"results": res, "applied": bool(body.get("apply"))}
+
     if path == "/api/supersede":
         old = str(body.get("old") or "").strip()
         text = str(body.get("text") or "").strip()

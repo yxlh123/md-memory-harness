@@ -802,5 +802,74 @@ class TestSupersede(unittest.TestCase):
         self.assertEqual(st2["深色主题"], "active")
 
 
+class TestConsolidate(unittest.TestCase):
+    """#1 合并/冲突处理：聚类 → 模型判断 → 按决策改库。"""
+
+    def setUp(self):
+        reset()
+        self._llm = harness.llm
+
+    def tearDown(self):
+        harness.llm = self._llm
+
+    def _fake(self, payload):
+        harness.llm = lambda msgs, **kw: json.dumps(payload, ensure_ascii=False)
+
+    def test_groups_only_overlapping_entries(self):
+        harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色，别太白。")
+        harness.save_memory("深色主题2", "界面还是深色好", "user", "界面要用深色主题，白色刺眼。")
+        harness.save_memory("qwen版本", "本地模型是 qwen2.5:7b", "reference",
+                            "Ollama 里装的是 qwen2.5:7b，context 32k。")
+        groups = harness.similar_groups()
+        names = [sorted(e["name"] for e in g) for g in groups]
+        self.assertIn(["深色主题", "深色主题2"], names)
+        self.assertTrue(all("qwen版本" not in g for g in names), "不相干的不该被凑成一组")
+
+    def test_merge_creates_new_and_supersedes_old(self):
+        harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色，别太白。")
+        harness.save_memory("深色主题2", "界面还是深色好", "user", "界面要用深色主题，白色刺眼。")
+        self._fake({"action": "merge",
+                    "merged": {"name": "深色界面", "description": "界面一律深色",
+                               "body": "界面用深色，白色刺眼。", "type": "user"},
+                    "reason": "说的是同一件事"})
+        res = harness.consolidate(apply=True)
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["applied"], "merge")
+        self.assertIn("深色界面", harness.find_memory("深色界面")[0])
+        for old in ("深色主题", "深色主题2"):
+            self.assertEqual(harness.status_of(harness.find_memory(old)[1]), "superseded")
+        names = harness.retrieve("深色界面")["names"]
+        self.assertIn("深色界面", names)
+        self.assertNotIn("深色主题", names)
+
+    def test_supersede_keeps_newest_when_model_forgets_name(self):
+        harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色，别太白。")
+        harness.save_memory("深色主题2", "界面还是深色好", "user", "界面要用深色主题，白色刺眼。")
+        self._fake({"action": "supersede", "reason": "后者更准确"})
+        res = harness.consolidate(apply=True)
+        self.assertEqual(res[0]["applied"], "supersede")
+        status = {n: harness.status_of(harness.find_memory(n)[1]) for n in ("深色主题", "深色主题2")}
+        self.assertEqual(list(status.values()).count("active"), 1)
+
+    def test_keep_does_nothing(self):
+        harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色，别太白。")
+        harness.save_memory("深色主题2", "界面还是深色好", "user", "界面要用深色主题，白色刺眼。")
+        self._fake({"action": "keep", "reason": "细节不同"})
+        before = sorted(f for f in os.listdir(harness.MEM_DIR) if not f.startswith("."))
+        res = harness.consolidate(apply=True)
+        self.assertEqual(res[0]["action"], "keep")
+        self.assertNotIn("applied", res[0])
+        after = sorted(f for f in os.listdir(harness.MEM_DIR) if not f.startswith("."))
+        self.assertEqual(after, before)
+
+    def test_broken_json_does_not_crash(self):
+        harness.save_memory("深色主题", "界面用深色", "user", "界面一直用深色，别太白。")
+        harness.save_memory("深色主题2", "界面还是深色好", "user", "界面要用深色主题，白色刺眼。")
+        harness.llm = lambda msgs, **kw: "我觉得挺好的"
+        res = harness.consolidate(apply=True)
+        self.assertEqual(res[0]["action"], "keep")
+        self.assertIn("判不动", res[0]["reason"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -128,6 +128,7 @@
       <div class="card" style="flex:1">
         <div class="row" style="margin:0 0 10px">
           <h3 style="flex:1;margin:0">全部记忆</h3>
+          <button class="ghost" id="consolidatebtn" title="让模型看看有没有该合并/顶掉的记忆">整理</button>
           <button class="ghost" id="importbtn">导入 .txt / .md</button>
           <input type="file" id="importfile" multiple accept=".txt,.md,.markdown" style="display:none">
           <input type="text" id="memsearch" placeholder="关键词过滤…" style="width:200px">
@@ -412,6 +413,26 @@ function renderMemories() {
   if (!list.children.length) list.innerHTML = '<div class="status">（无匹配）</div>';
 }
 $('#memsearch').addEventListener('input', renderMemories);
+/* ---------- 整理记忆（consolidate） ---------- */
+const ACTS = {merge: '合并成一条', supersede: '新版顶掉旧的', keep: '各记各的，不动'};
+$('#consolidatebtn').onclick = async () => {
+  const btn = $('#consolidatebtn');
+  btn.disabled = true; btn.textContent = '看…';
+  try {
+    const j = await api('/api/consolidate', {apply: false});
+    const res = j.results || [];
+    if (!res.length) return toast('没发现内容重叠的记忆');
+    const lines = res.map(d => '· ' + d.names.join(' / ') + ' → ' + (ACTS[d.action] || d.action) +
+      (d.reason ? '\n    ' + d.reason : ''));
+    const todo = res.filter(d => d.action !== 'keep' && (d.reason || '').indexOf('判不动') !== 0);
+    if (!todo.length) return alert('发现了几组重叠，但模型建议都别动：\n\n' + lines.join('\n'));
+    if (!confirm('建议这样整理：\n\n' + lines.join('\n') + '\n\n要按建议改库吗？（旧条目会标成旧版，文件不删，能恢复）')) return;
+    const j2 = await api('/api/consolidate', {apply: true});
+    state = await api('/api/state'); renderAll();
+    toast('已整理 ' + (j2.results || []).filter(d => d.applied && d.applied !== 'keep').length + ' 组');
+  } catch (e) { toast('整理失败：' + e.message); }
+  finally { btn.disabled = false; btn.textContent = '整理'; }
+};
 $('#savemem').onclick = async () => {
   const text = $('#newmem').value.trim();
   if (!text) return toast('内容为空');

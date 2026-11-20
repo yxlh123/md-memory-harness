@@ -35,7 +35,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.9.0"
+VERSION = "2.10.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -801,6 +801,145 @@ def _already_known(name):
         return False
     return bool(ranked) and ranked[0][0] >= 0.9
 
+
+# ---------- 合并 / 冲突处理（consolidate） ----------
+
+CONSOLIDATE_SYS = """你是记忆库整理器。给你一组内容高度重叠的记忆，判断该怎么处理。
+
+三种动作：
+- merge：内容互补，合成一条更好的（把各自的要点都保留）
+- supersede：其中一条更新、更准确，已经盖住了其它几条
+- keep：各自记的其实是不同的事，不该动
+
+宁可 keep，不要为了"整理干净"丢掉信息。只输出 JSON：
+{"action": "merge|supersede|keep",
+ "keep": "supersede 时保留哪条（写它的名字）",
+ "merged": {"name": "合并后的短名字", "description": "一句话", "body": "合并后的正文", "type": "user|feedback|project|reference"},
+ "reason": "一句话说明"}"""
+
+
+def _entry_tokens(e):
+    return set(e.get("tokens") or []) | set(e.get("head_tokens") or [])
+
+
+def _jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _similarity(a, b):
+    """两条记忆的相似度 = max(Jaccard, 包含度)。
+
+    只用 Jaccard 会把"短的一条几乎包在长的一条里"这种情况漏掉
+    （短条目 10 个词元、长条目 25 个，交集 5 个：Jaccard 0.17、包含度 0.5）；
+    包含度高了多半是同一件事被反复记。
+    """
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    return max(inter / len(a | b), inter / min(len(a), len(b)))
+
+
+def similar_groups(threshold=0.3, max_groups=8, max_size=4):
+    """把内容高度重叠的 active 条目聚成组；每组 2~max_size 条。"""
+    idx = load_index()
+    entries = [e for e in idx["entries"] if e.get("status", "active") == "active"]
+    toks = [_entry_tokens(e) for e in entries]
+    parent = list(range(len(entries)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            if _similarity(toks[i], toks[j]) >= threshold:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[rj] = ri
+
+    buckets = {}
+    for i in range(len(entries)):
+        buckets.setdefault(find(i), []).append(entries[i])
+    groups = [g[:max_size] for g in buckets.values() if len(g) >= 2]
+    groups.sort(key=len, reverse=True)
+    return groups[:max_groups]
+
+
+def judge_group(group, use_llm=True):
+    """让模型判断一组记忆怎么处理；返回决策 dict（action/keep/merged/reason）。"""
+    names = [e["name"] for e in group]
+    if not use_llm:
+        return {"action": "keep", "names": names, "reason": "没调模型（--no-llm）"}
+    listing = "\n\n".join(
+        f"- 名字：{e['name']}\n  类型：{e.get('type')}\n  描述：{e.get('description')}\n"
+        f"  正文：{_entry_body(e)[:500]}" for e in group)
+    out = llm([
+        {"role": "system", "content": CONSOLIDATE_SYS},
+        {"role": "user", "content": f"这几条记忆：\n\n{listing}"},
+    ], temperature=0.1)
+    d = extract_json(out)
+    action = str(d.get("action") or "keep").strip().lower()
+    if action not in ("merge", "supersede", "keep"):
+        action = "keep"
+    return {"action": action, "names": names,
+            "keep": str(d.get("keep") or ""), "merged": d.get("merged") or {},
+            "reason": str(d.get("reason") or "")}
+
+
+def _apply_group(group, decision):
+    """按决策改库：merge 会新存一条、把组内旧的降级；supersede 只降级。"""
+    action = decision.get("action") or "keep"
+    names = [e["name"] for e in group]
+    if action == "keep":
+        return "keep", []
+    if action == "supersede":
+        keep = decision.get("keep") or ""
+        if keep not in names:
+            keep = group[-1]["name"]            # 模型没给名字就用最新那条
+        for n in names:
+            if n != keep:
+                supersede_memory(n, keep)
+        return "supersede", [keep]
+    merged = decision.get("merged") or {}
+    body = str(merged.get("body") or "").strip()
+    if not body:                                # 模型没给正文：把各条拼起来，别丢内容
+        body = "\n".join(f"- {_entry_body(e).strip()}" for e in group)
+    base = group[-1]                            # 最新的一条当底
+    name = str(merged.get("name") or base["name"])
+    desc = str(merged.get("description") or base.get("description") or "")
+    mtype = merged.get("type") if merged.get("type") in TYPES else base.get("type", "project")
+    new_name, _ = save_memory(name, desc, mtype, body, source="consolidate 合并")
+    for n in names:
+        if n != new_name:
+            supersede_memory(n, new_name)
+    return "merge", [new_name]
+
+
+def consolidate(apply=False, threshold=0.3, max_groups=8, use_llm=True):
+    """跑一轮整理：先聚类，再逐组让模型判断；apply=False 只看建议。"""
+    out = []
+    for g in similar_groups(threshold=threshold, max_groups=max_groups):
+        try:
+            d = judge_group(g, use_llm=use_llm)
+        except Exception as e:
+            out.append({"action": "keep", "names": [x["name"] for x in g],
+                        "reason": f"判不动（{e}）"})
+            continue
+        if apply and d["action"] != "keep":
+            try:
+                act, made = _apply_group(g, d)
+                d["applied"], d["result"] = act, made
+            except Exception as e:
+                d["applied"] = "failed"
+                d["reason"] = f"{d.get('reason', '')} / 执行失败：{e}".strip(" /")
+        out.append(d)
+    return out
+
+
 def _journal_path(block):
     return os.path.join(JOURNAL_DIR, f"{block}.md")
 
@@ -1151,6 +1290,21 @@ def cmd_restore(a):
     print(f"已恢复 {meta.get('name', a.name)} 为 active")
 
 
+def cmd_consolidate(a):
+    res = consolidate(apply=a.apply, threshold=a.threshold, use_llm=not a.no_llm)
+    if not res:
+        print("没发现内容重叠的记忆，库里挺干净。")
+        return
+    acts = {"merge": "合并", "supersede": "新版顶掉旧的", "keep": "各记各的，不动"}
+    for d in res:
+        made = f" → 新条目 {d['result'][0]}" if d.get("result") else ""
+        print(f"- {' / '.join(d['names'])}：{acts.get(d['action'], d['action'])}{made}")
+        if d.get("reason"):
+            print(f"      {d['reason']}")
+    if not a.apply:
+        print("\n以上只是建议，没动库。加 --apply 才会真的合并/降级。")
+
+
 def cmd_list(a):
     print_memories()
 
@@ -1398,6 +1552,13 @@ def main():
     p = sub.add_parser("restore", help="把 superseded 的条目恢复成 active")
     p.add_argument("name", help="记忆名")
     p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("consolidate", help="找出内容重叠的记忆，让模型判断合并/顶掉/保留")
+    p.add_argument("--apply", action="store_true", help="真的改库（默认只看建议）")
+    p.add_argument("--threshold", type=float, default=0.3, metavar="0~1",
+                   help="多相似才算一组，默认 0.3（按词元 Jaccard）")
+    p.add_argument("--no-llm", action="store_true", help="只聚类、不调模型判断")
+    p.set_defaults(func=cmd_consolidate)
 
     p = sub.add_parser("chat", help="对话模式：带记忆的连续对话（超预算自动摘要）")
     p.add_argument("--budget", type=int, default=None, help="历史字符预算，默认取配置")

@@ -72,6 +72,7 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | `save <内容> [--type user\|feedback\|project\|reference] [--no-llm] [--supersedes 旧名]` | 存一条记忆，默认让模型起名/写描述/判类型 |
 | `supersede <旧名> <新内容> [--type T] [--no-llm]` | 存新版、把旧版标成 superseded（旧文件留着，检索不再带它） |
 | `restore <名字>` | 把 superseded 的条目恢复成 active |
+| `consolidate [--apply] [--threshold 0~1] [--no-llm]` | 找出内容重叠的记忆，让模型判断合并/顶掉/保留（默认只看建议） |
 | `chat [--budget N] [--image 图] [--no-stream]` | 连续对话；默认逐字流式显示；`/save`、`/search`、`/list`、`/history`、`/img`、`/new`、`/exit` |
 | `ask <问题> [--image 图] [--no-stream]` | 单次问答（检索记忆后提问），可附图，默认流式 |
 | `list` | 列出全部记忆 |
@@ -187,6 +188,25 @@ python harness.py supersede 深色主题 "界面还是浅色护眼" --type user
 旧条目的**文件不删**——只是不再进检索（`rank_entries` 跳过非 `active` 的条目），`show` 还能看，网页端会显示成淡色 + `旧版` 标签，点「恢复」就重新生效（`python harness.py restore 深色主题`）。
 
 没删是因为"我当时为什么那么想"经常有用；真相是内存要干净、历史要留着，两件事分开做。
+
+## 同一件事记了两遍（consolidate）
+
+库里条数上百以后，会自动长出「深色主题」「深色主题2」这种半重复条目——它们是不同时间聊出来的同一件事，只是话不一样。`_already_known()` 只能拦下**几乎一字不差**的重复（相似度 ≥ 0.9），换个说法就漏过去了。
+
+```bash
+python harness.py consolidate                    # 只看建议，不动库
+python harness.py consolidate --apply            # 按建议真的合并
+python harness.py consolidate --threshold 0.45   # 收紧，只处理更像的（默认 0.3）
+python harness.py consolidate --no-llm           # 只聚类，不让模型判断
+```
+
+流程三步：
+
+1. **聚类**：把 active 条目按词元相似度做并查集，相似度取 `max(Jaccard, 包含度)`——只用 Jaccard 会漏掉"短的一条几乎包在长的一条里"的情况（交集 5 个词：Jaccard 0.17、包含度 0.5）；
+2. **判断**：每组甩给模型，让它三选一 `merge`（合成一条新的）/ `supersede`（新的顶掉旧的）/ `keep`（各记各的别动），必须给理由。提示词里明确"拿不准就 keep"——合并错了比留两条更贵；
+3. **执行**：`merge` 存新条目并把组里旧的都标 `superseded`；`supersede` 保留组里最新那条、把其余标旧；`keep` 什么都不做。旧条目**文件都不删**，跟上面的 supersede 一样能恢复。
+
+默认是 dry-run，只打印建议。网页端「记忆」面板右上角的「整理」按钮做同一件事：先算一遍给你看，你确认了才改库。
 
 ## 检索是怎么做的
 
@@ -313,7 +333,7 @@ python harness.py supersede 深色主题 "界面还是浅色护眼" --type user
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 61 个用例，不联网
+python -m unittest discover -s tests -v     # 66 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
@@ -321,7 +341,7 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：记忆合并/冲突处理（consolidate）、supersede 版本机制、本地 embedding 语义检索、memories 目录 git 化、网页管理面、token 用量统计。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）。
+排期见 [ROADMAP.md](ROADMAP.md)：本地 embedding 语义检索、memories 目录 git 化、网页管理面、token 用量统计。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）。
 
 ## 许可
 
