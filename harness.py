@@ -25,6 +25,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -36,7 +38,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.14.0"
+VERSION = "2.15.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -49,6 +51,7 @@ _DEFAULTS = {
     "retrieve_budget": "6000",   # 每次带进 prompt 的记忆字符数上限
     "history_budget": "8000",    # 对话历史字符数上限，超了就把旧对话压成摘要
     "auto_save": "auto",         # 记忆自动捕获：auto 直接存 / suggest 先问一句 / off 不猜
+    "memory_git": "auto",        # 记忆目录版本历史：auto 有 git 就记 / off 不记
     "embed_model": "",           # 语义检索用的 embedding 模型（空 = 只用关键词）
     "embed_base_url": "http://127.0.0.1:11434/v1",   # 默认走本机 Ollama
     "embed_api_key": "",         # 云端 embedding 才需要
@@ -171,6 +174,116 @@ ASK_SYS = ("你是基于本地记忆的问答助手。只依据给出的记忆�
 
 # ---------- 存储层 ----------
 
+# ---- 记忆目录的版本历史 ----
+# 用 git --git-dir 指向 memories/ 的兄弟目录 .memory-history，不在 memories/ 里塞 .git，
+# 也不影响项目本身的 git 仓库。只为「删错能翻回去」「改了什么有据可查」，不影响检索。
+MEMGIT_EXCLUDES = (".index.json", ".vectors.json", ".usage.json",
+                   ".stats.json", ".journal-index.json", ".trash/")
+
+
+def memgit_path():
+    # normpath 很要紧：MEM_DIR 里带 ".." 时 git 会报 Invalid path
+    parent = os.path.dirname(os.path.normpath(os.path.abspath(MEM_DIR)))
+    return os.path.join(parent, ".memory-history")
+
+
+def _git_bin():
+    return shutil.which("git")
+
+
+def memgit_enabled():
+    if str(CFG.get("memory_git", "auto")).lower() == "off":
+        return False
+    return bool(_git_bin())
+
+
+def _memgit_run(*args, timeout=30):
+    work = os.path.normpath(os.path.abspath(MEM_DIR))   # 必须绝对且归一，否则 git 报 Invalid path
+    os.makedirs(work, exist_ok=True)
+    cmd = [_git_bin(), "--git-dir", memgit_path(), "--work-tree", work] + list(args)
+    env = dict(os.environ)
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(k, None)
+    env.setdefault("GIT_AUTHOR_NAME", "md-memory-harness")
+    env.setdefault("GIT_AUTHOR_EMAIL", "memory@localhost")
+    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+    env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
+    env.setdefault("LC_ALL", "C")
+    return subprocess.run(cmd, cwd=work, capture_output=True, timeout=timeout, env=env,
+                          encoding="utf-8", errors="replace")
+
+
+def _memgit_is_repo():
+    """目录在不算数，得有 HEAD 才算一个真正的仓库。"""
+    d = memgit_path()
+    return os.path.isdir(d) and os.path.isfile(os.path.join(d, "HEAD"))
+
+
+def _memgit_init():
+    d = memgit_path()
+    os.makedirs(os.path.join(d, "info"), exist_ok=True)
+    r = _memgit_run("init", "-q")
+    if not os.path.isdir(os.path.join(d, "objects")):
+        return False                     # 初始化失败（没权限、路径怪）就当没有版本历史
+    _memgit_run("config", "user.name", "md-memory-harness")
+    _memgit_run("config", "user.email", "memory@localhost")
+    _memgit_run("config", "core.autocrlf", "false")
+    ex = os.path.join(d, "info", "exclude")
+    if not os.path.exists(ex):
+        _atomic_write(ex, "\n".join(MEMGIT_EXCLUDES) + "\n")
+    return True
+
+
+def memgit_commit(message):
+    """把 memories/ 当前状态提交进版本库。没装 git / 出错就静默跳过，绝不影响保存。"""
+    if not memgit_enabled():
+        return False
+    try:
+        if not _memgit_is_repo():
+            shutil.rmtree(memgit_path(), ignore_errors=True)   # 清掉半残的初始化
+            if not _memgit_init():
+                return False
+        _memgit_run("add", "-A", "--", ".")
+        r = _memgit_run("commit", "-q", "-m", message)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def memgit_log(limit=20, name=""):
+    if not memgit_enabled() or not _memgit_is_repo():
+        return ""
+    args = ["log", "-n", str(limit), "--pretty=%h %ad %s", "--date=short"]
+    if name:
+        args += ["--", name + ".md"]
+    r = _memgit_run(*args)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def memgit_restore_file(sha, name):
+    """把某次提交里的记忆文件原样写回 memories/（覆盖同名文件），并提交这一步。"""
+    fn = name if name.endswith((".md", ".txt")) else name + ".md"
+    r = _memgit_run("show", f"{sha}:{fn}")
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        raise ValueError(f"提交 {sha} 里没有 {fn}")
+    path = os.path.join(MEM_DIR, fn)
+    _atomic_write(path, r.stdout)
+    rebuild_index()
+    memgit_commit(f"从 {sha} 恢复 {fn}")
+    return path
+
+
+def memgit_show(sha, name=""):
+    if not memgit_enabled() or not _memgit_is_repo():
+        return ""
+    args = ["show", "--patch", sha]
+    if name:
+        args += ["--", name + ".md"]
+    r = _memgit_run(*args)
+    return r.stdout if r.returncode == 0 else ""
+
+
 def _atomic_write_bytes(path, data):
     """二进制版的原子写（图片用）。"""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -253,13 +366,17 @@ def supersede_memory(old, by):
     """把旧记忆标成"已被这条取代"；检索不再带它，但文件还在、能查能恢复。"""
     if not find_memory(old):
         raise FileNotFoundError(f"找不到记忆 {old}")
-    return _set_meta(old, {"status": "superseded", "superseded_by": by,
+    meta = _set_meta(old, {"status": "superseded", "superseded_by": by,
                            "superseded_on": datetime.date.today().isoformat()})
+    memgit_commit(f"取消 {old}（被 {by} 取代）")
+    return meta
 
 
 def restore_memory(name):
     """把 superseded 的条目恢复成 active。"""
-    return _set_meta(name, {"status": None, "superseded_by": None, "superseded_on": None})
+    meta = _set_meta(name, {"status": None, "superseded_by": None, "superseded_on": None})
+    memgit_commit(f"恢复 {name}")
+    return meta
 
 
 def _memory_files():
@@ -360,6 +477,7 @@ def save_memory(name, description, mtype, body, source="", supersedes=""):
         except FileNotFoundError:
             pass                                    # 新条目已经写好了，旧名打错不该把这次保存弄失败
     rebuild_index()
+    memgit_commit(f"保存 {name}")
     return name, path
 
 
@@ -372,12 +490,14 @@ def delete_memory(name, purge=False):
     if purge:
         os.remove(path)
         rebuild_index()
+        memgit_commit(f"彻底删除 {name}")
         return path
     os.makedirs(TRASH_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     target = os.path.join(TRASH_DIR, f"{stamp}-{os.path.basename(path)}")
     os.replace(path, target)
     rebuild_index()
+    memgit_commit(f"移到回收站 {name}")
     return target
 
 
@@ -1932,6 +2052,9 @@ def cmd_config(a):
         print(f"retrieve_budget= {CFG.get('retrieve_budget')} 字符（每次带进 prompt 的记忆上限）")
         print(f"history_budget = {CFG.get('history_budget')} 字符（对话历史超了自动摘要）")
         print(f"auto_save      = {CFG.get('auto_save')}（auto 自动存记忆 / suggest 先问 / off 只手动）")
+        _mg = CFG.get("memory_git", "auto")
+        _mg_hint = "每次改动都在 .memory-history/ 记一笔" if memgit_enabled() else "没装 git 或已关闭，不记历史"
+        print(f"memory_git     = {_mg}（{_mg_hint}）")
         print(f"\n配置文件：{CONFIG_FILE}")
         print("优先级：环境变量 > config.json > 默认")
         print("设置示例：python harness.py config set base_url http://127.0.0.1:11434/v1")
@@ -1953,6 +2076,32 @@ def cmd_config(a):
     save_config(key, value)
     print(f"已写入 {CONFIG_FILE}: {key} = {value}")
     print("（环境变量优先于 config.json；下次运行命令即生效）")
+
+
+def cmd_history(a):
+    if not memgit_enabled():
+        print("这台机器没有 git，或配置里 memory_git = off —— 没有版本历史。")
+        return
+    if not os.path.isdir(memgit_path()):
+        print("还没有历史（保存过第一条记忆之后才开始记）。")
+        return
+    if a.show:
+        out = memgit_show(a.show, a.name or "")
+        print(out.strip() or "没有这条记录。")
+        return
+    out = memgit_log(a.limit, a.name or "")
+    print(out or "还没有改动记录。")
+
+
+def cmd_recover(a):
+    if not memgit_enabled():
+        print("这台机器没有 git，或配置里 memory_git = off —— 没法从历史恢复。")
+        return
+    try:
+        path = memgit_restore_file(a.sha, a.name)
+    except ValueError as e:
+        sys.exit(str(e))
+    print(f"已从 {a.sha} 写回：{path}")
 
 
 def cmd_delete(a):
@@ -2060,6 +2209,17 @@ def main():
     p = sub.add_parser("log", help="查看对话压缩留下的原文块（log show c1 回读全文）")
     p.add_argument("show", nargs="?", default=None, help="块号，如 c1；省略则列出全部")
     p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("history", help="记忆目录的改动历史（save/删除/恢复都会自动记一笔）")
+    p.add_argument("--limit", type=int, default=20, help="看最近几条")
+    p.add_argument("--name", default=None, help="只看某条记忆的历史")
+    p.add_argument("--show", default=None, help="看某次改动的内容（提交号）")
+    p.set_defaults(func=cmd_history)
+
+    p = sub.add_parser("recover", help="从历史里把某一版记忆写回来（recover <提交号> <名字>）")
+    p.add_argument("sha", help="提交号，来自 history 命令")
+    p.add_argument("name", help="记忆名（文件名去掉 .md 也行）")
+    p.set_defaults(func=cmd_recover)
 
     p = sub.add_parser("import", help="导入 .txt/.md 文件为记忆（可一次多个；md 自带 frontmatter 时直接复用）")
     p.add_argument("files", nargs="+", help="文件路径")

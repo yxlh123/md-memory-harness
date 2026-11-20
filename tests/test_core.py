@@ -32,6 +32,20 @@ def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
 
+def _force_rmtree(path):
+    """Windows 上 git 留下的文件可能带只读位，rmtree 会半途而废——再试一次。"""
+    shutil.rmtree(path, ignore_errors=True)
+    if not os.path.isdir(path):
+        return
+    for root, dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                os.chmod(os.path.join(root, fn), 0o600)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def reset():
     """清空记忆目录，给每个用例一个干净环境。"""
     if os.path.isdir(harness.MEM_DIR):
@@ -1139,3 +1153,65 @@ class TestSummaryTiering(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipUnless(shutil.which("git"), "需要 git 才能测记忆目录的版本历史")
+class TestMemoryGit(unittest.TestCase):
+    """memories/ 的改动要能翻回去：删错、改坏、被顶掉都还有据可查。"""
+
+    def setUp(self):
+        reset()
+        _force_rmtree(harness.memgit_path())
+        self._mode = harness.CFG.get("memory_git")
+        harness.CFG["memory_git"] = "auto"
+
+    def tearDown(self):
+        harness.CFG["memory_git"] = self._mode
+
+    def _head(self):
+        return harness._memgit_run("rev-parse", "HEAD").stdout.strip()
+
+    def test_save_and_delete_are_both_committed(self):
+        harness.save_memory("深色主题", "偏好深色", "user", "喜欢深色界面。")
+        self.assertIn("保存 深色主题", harness.memgit_log(10))
+        harness.delete_memory("深色主题")
+        self.assertIn("移到回收站 深色主题", harness.memgit_log(10))
+
+    def test_bad_edit_can_be_rolled_back(self):
+        name, path = harness.save_memory("深色主题", "偏好深色", "user", "喜欢深色界面。")
+        sha = self._head()
+        harness._atomic_write(path, harness._read_text_file(path) + "手滑改坏的一行\n")
+        harness.rebuild_index()
+        harness.memgit_commit("改坏了")
+        harness.memgit_restore_file(sha, name)
+        self.assertNotIn("手滑改坏", harness._read_text_file(path))
+        self.assertIn("喜欢深色界面", harness._read_text_file(path))
+
+    def test_cache_files_stay_out_of_history(self):
+        harness.save_memory("深色主题", "偏好深色", "user", "喜欢深色界面。")
+        harness.touch_usage(["深色主题"])
+        harness.retrieve("深色主题")
+        listed = harness._memgit_run("ls-files", "-z").stdout
+        self.assertIn("深色主题.md", listed)
+        for junk in (".usage.json", ".index.json", ".vectors.json", ".stats.json"):
+            self.assertNotIn(junk, listed)
+
+    def test_switching_it_off_stops_recording(self):
+        harness.save_memory("浅色主题", "偏好浅色", "user", "喜欢浅色界面。")
+        before = harness.memgit_log(10)
+        self.assertIn("浅色主题", before)
+        harness.CFG["memory_git"] = "off"
+        harness.save_memory("深色主题", "偏好深色", "user", "喜欢深色界面。")
+        harness.CFG["memory_git"] = "auto"        # 打开再读，才看得到这段时间没记新账
+        after = harness.memgit_log(10)
+        self.assertIn("浅色主题", after)
+        self.assertNotIn("深色主题", after, "off 之后不该再记新账")
+        # 关掉只是不记录，记忆本身照存
+        self.assertIsNotNone(harness.find_memory("深色主题"))
+
+    def test_history_can_be_filtered_by_name(self):
+        harness.save_memory("深色主题", "偏好深色", "user", "喜欢深色界面。")
+        harness.save_memory("浅色主题", "偏好浅色", "user", "现在喜欢浅色。")
+        only = harness.memgit_log(10, "深色主题")
+        self.assertIn("深色主题", only)
+        self.assertNotIn("浅色主题", only)

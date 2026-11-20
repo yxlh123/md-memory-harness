@@ -10,3 +10,4 @@ memories/.trash/
 access.log
 memories/.stats.json
 memories/.vectors.json
+.memory-history/

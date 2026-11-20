@@ -1,6 +1,6 @@
 # 待办路线图（用户 2026-11-20 指定）
 
-> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0）、#2（v2.9.0）、#1（v2.10.0）、#9（v2.11.0）、#4（v2.12.0），见文末「已完成」。
+> 状态：**未完成项只记录、未动代码**。已落地：#3（v2.6.0）、#6（v2.7.0）、#5（v2.8.0）、#2（v2.9.0）、#1（v2.10.0）、#9（v2.11.0）、#4（v2.12.0）、#7（v2.15.0），见文末「已完成」。
 > 九项都由用户提出（#1–#4 与 #5–#9 都是 2026-11-20 一次性给的），以下是原始意图 + 落地要点。按依赖关系排序见文末。
 
 ## 1. 记忆合并 / 冲突处理（consolidate）—— ✅ 已完成（v2.10.0，2026-11-21）
@@ -68,7 +68,17 @@ frontmatter 再加两个字段：
 
 评价：纯体验向，改动集中在 `llm()` 与 `webui.py` 的转发，风险低、见效快。
 
-## 7. memories 目录 git 化
+## 7. memories 目录 git 化 —— ✅ 已完成（v2.15.0，2026-11-21）
+
+落地时改了个方向：**不**在 `memories/` 里塞 `.git`，而是在它旁边放 `.memory-history/`，用
+`git --git-dir=.memory-history --work-tree=memories` 操作。理由：`memories/` 很可能已经在某个项目仓库里，
+嵌套一个 `.git` 会让外层仓库把它当 gitlink，既难解释也容易踩坑。
+
+- 存、软删、彻底删、supersede、恢复、从历史写回——各提交一次；`memory_git=off` 可关，没装 git 就静默跳过
+- 缓存文件（`.index.json`/`.vectors.json`/`.usage.json`/`.stats.json`/`.trash/`）写进 `info/exclude`，历史里只有记忆本身
+- 新增 `history [--name] [--show]` 与 `recover <提交号> <名字>`：删掉的文件也能从历史里捞回来
+- 5 个离线用例（`TestMemoryGit`），需要机器上有 git，没有就 skip
+- 踩过的坑：`MEM_DIR` 带 `..` 时 git 报 `Invalid path`，必须 `normpath`；`subprocess` 用 `text=True` 会按 GBK 解码中文提交信息，得显式 `encoding="utf-8"`；初始化失败会留下只有 `objects/` 的空壳目录，所以判断"是不是仓库"要看 `HEAD` 而不是目录存在
 
 `save` / `delete` / `consolidate` 后自动 `git commit`（只提交 `memories/`）。
 
@@ -116,6 +126,14 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 - 用户偏好：先给结论再讲理由；英文术语要带中文解释
 
 ## 已完成
+
+### v2.15.0（2026-11-21）—— #7 记忆目录版本历史
+
+- 用户前提不变：「永久记忆不能动，除非人工剔除」——所以版本历史是**加保护**，不是加清理：删记忆只删当前文件，历史里那版还在，`recover` 能写回来
+- `memories/` 旁边一个独立 git 仓库 `.memory-history/`，`git --git-dir ... --work-tree memories` 操作，不嵌套、不影响项目仓库
+- 自动提交时机：`save_memory` / `delete_memory`（软删与 purge 分开写）/ `supersede_memory` / `restore_memory` / `memgit_restore_file`
+- CLI：`history`、`history --name`、`history --show <sha>`、`recover <sha> <名字>`；配置项 `memory_git=auto|off`
+- 90 个用例全绿（新增 `TestMemoryGit` 5 个，git 不存在时自动 skip）
 
 ### v2.14.0（2026-11-21）—— 压缩掉的对话可检索 + 摘要分层
 

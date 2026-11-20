@@ -21,6 +21,7 @@
 - **一条记忆一个 `.md`**：`frontmatter` + 正文，可以直接用编辑器改，也可以 `git` 管版本。
 - **原子写**：先写临时文件再改名，断电或 Ctrl+C 不会留下半个文件。
 - **软删除**：默认移进 `memories/.trash/`，删错了还能捞回来；`--purge` 才是真删。
+- **目录自带版本历史**：每次存/删/恢复都在 `memories/` 旁边的 `.memory-history/` 里记一笔（独立 git 仓库），哪天改坏了 `history` 一查、`recover` 写回来。删记忆永远不会让历史跟着没了。
 - **中文可搜**：中文按二元组（bigram）切分建索引，`主题偏好` 和 `偏好主题` 都能命中（旧版子串匹配做不到）。
 - **三级回退检索**：命中明确给摘要 + 开头，命中偏弱给命中词附近的片段，完全没命中就只给最近几条并明确标注——不会因为"没搜到"就把整个库倒进 prompt。
 - **对话摘要压缩**：历史超过字符预算时，把较早的对话压成摘要，原文写进 `journal/c1.md`、`c2.md`…，摘要里带块号，`log show c1` 可回读全文。
@@ -83,6 +84,8 @@ Windows 上可以直接双击 `ui.bat` / `chat.bat`。
 | `log [c1]` | 列出对话压缩块 / 回读某块全文 |
 | `import <文件...> [--type T] [--no-llm]` | 导入 `.txt`/`.md`；UTF-8 和 GBK 都认 |
 | `stats` | 看 token 用量（累计 + 最近 7 天） |
+| `history [--name 名字] [--show 提交号]` | 记忆目录的改动历史（存、改、删、恢复都记一笔） |
+| `recover <提交号> <名字>` | 把历史里的某一版原样写回来 |
 | `rebuild` | 重建 `MEMORY.md` 和 `.index.json` |
 | `config [set <key> <value>]` | 查看/写入配置 |
 
@@ -300,8 +303,27 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 | 对话原文索引 | `journal/.journal-index.json` | **自动**（新块出现就重建；只存词元与位置，不存正文） |
 | 记忆条目 | `memories/<名字>.md` | `auto_save=auto` 时**自动**（每轮判断一次）；`suggest` 时先问你；`off` 时纯手动 |
 | 记忆总览 | `memories/MEMORY.md` | **自动**（增删记忆时重建，只给人看） |
+| 记忆改动历史 | `.memory-history/`（`memories/` 的兄弟目录） | **自动**（每次存/删/恢复后提交；`memory_git=off` 可关） |
 
 也就是说：`journal/` 是聊天留下的痕迹，`memories/` 是长期知识。默认 `auto_save=auto`，模型觉得"这句话里有该长期记住的东西"就直接写进 `memories/`；不想让它自作主张就切到 `suggest`（每轮弹一句"要记吗"）或 `off`（只存你手动的）。
+
+## 记忆目录的版本历史
+
+`memories/` 里每一条改动——保存、软删、supersede、恢复、从历史写回——都会在旁边的 `.memory-history/` 里提交一次，
+所以「上周那条记忆原来写了什么」「删掉的那条正文是什么」都查得到。这是个**独立的 git 仓库**，不碰你项目自己的 `.git`，
+也不会把 `.git` 塞进 `memories/` 里。
+
+```bash
+python harness.py history                    # 最近 20 条改动
+python harness.py history --name 深色主题    # 只看某一条
+python harness.py history --show 7bc433b     # 某次改动改了什么
+python harness.py recover 7bc433b 深色主题   # 把那一版原样写回来（会自动提交一次）
+```
+
+- **删记忆不会删历史**：`delete --purge` 只删当前文件，那个文件的内容还躺在历史里，`recover` 能捞回来。
+- **缓存文件不入库**：`.index.json`、`.vectors.json`、`.usage.json`、`.stats.json`、`.trash/` 都由 `info/exclude` 排除，历史里只有记忆本身。
+- **没装 git 就不记**：静默跳过，保存照常成功；想关掉就 `config set memory_git off`。
+- 版本库默认放在 `memories/` 的兄弟目录；如果 `memory_dir` 指到别处，版本库跟着落在那个目录旁边。
 
 ## 记忆自动捕获（auto_save）
 
@@ -339,6 +361,7 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 | `embed_base_url` | — | `http://127.0.0.1:11434/v1` | embedding 服务地址（默认本机 Ollama） |
 | `embed_api_key` | — | 空 | 云端 embedding 才需要 |
 | `embed_weight` | — | `0.6` | 语义分占多大比重（0~1） |
+| `memory_git` | — | `auto` | 记忆目录版本历史：`auto` 有 git 就记 / `off` 不记 |
 
 也可以用 `python harness.py config set model qwen3:4b` 写入 `config.json`。
 
@@ -377,7 +400,7 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 85 个用例，不联网
+python -m unittest discover -s tests -v     # 90 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
@@ -385,7 +408,7 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：memories 目录 git 化、网页管理面。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）、可选语义检索 embedding（v2.12.0）、语义检索开关 + 虚词过滤（v2.13.0）、压缩对话可检索 + 摘要分层（v2.14.0）。
+排期见 [ROADMAP.md](ROADMAP.md)：只剩网页管理面。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）、可选语义检索 embedding（v2.12.0）、语义检索开关 + 虚词过滤（v2.13.0）、压缩对话可检索 + 摘要分层（v2.14.0）、记忆目录版本历史（v2.15.0）。
 
 ## 许可
 
