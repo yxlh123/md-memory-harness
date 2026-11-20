@@ -2,7 +2,7 @@
 
 共 4 条。本文件由 `python harness.py rebuild` 自动生成，手改会被覆盖。
 
-- [写作风格](写作风格.md) — 文档不要客套话，段落短，能列表就列表
-- [回答偏好](回答偏好.md) — 先给结论再展开，英文术语第一次出现时带中文解释
-- [工作环境](工作环境.md) — Windows 11 + PowerShell + Python 3.13，脚本优先用标准库
-- [使用markdown工具](使用markdown工具.md) — 用户希望使用Markdown工具进行文档编写。
+- [使用markdown工具](使用markdown工具.md) — 写文档用 md
+- [写作风格](写作风格.md) — 文档不要客套话
+- [回答偏好](回答偏好.md) — 先给结论
+- [工作环境](工作环境.md) — 本机 Windows

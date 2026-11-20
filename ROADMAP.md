@@ -117,6 +117,17 @@ LLM 响应里的 `usage` 字段现在被扔掉了。
 
 ## 已完成
 
+### v2.14.0（2026-11-21）—— 压缩掉的对话可检索 + 摘要分层
+
+- 用户拍板：「永久记忆这块不能动，这是这个项目的初心；剩下的你可以看着优化」→ 记忆条目与 `journal/` 原文**一律不设上限**，只管"每轮塞进 prompt 的那部分"
+- `journal/` 单独建索引（`journal/.journal-index.json`，按 `文件名:size` 签名，变了才重建），`rank_journal()` 用同一套 IDF 打分（门槛 0.35，比记忆高），`_journal_snippet()` 摘命中最多的一行（160 字内）
+- `retrieve()` 返回值新增 `journal` / `blocks`：记忆命中之外再带 1~2 段原文片段；记忆库全空时直接走 `tier="journal"`
+- `prepare()` 把原文片段标成「压缩前的原话，和摘要冲突时以这里为准」
+- 摘要二级压缩：`SUMMARY_MAX_LINES=20` / `SUMMARY_KEEP_LINES=12` / `SUMMARY_CAP=6000`，`tier_summary()` 把最老的一批合成 `- [c1–c12] …`（块号区间保留），原文一个不删
+- 为什么：16K 上下文中记忆 6000 字 + 历史 8000 字之后只剩约 6700 token，每块摘要约 40 token，一百多块后每轮开始挤——压的只是"每轮要发出去的那份稿"
+- 新增 8 个用例（`TestJournalRecall` 4、`TestSummaryTiering` 4），共 **85 个全绿**
+- `print_search()` 和 `/api/search` 也会带上原文命中（`journal_text` / `journal_blocks`）
+
 ### v2.11.0（2026-11-21）—— #9 token 用量统计
 
 - `llm()` 拿到 `usage` 不再扔：`record_usage()` 归一后累计进 `memories/.stats.json`（总量 + 按天）；`load_stats()` / `stats_totals()` 读回来

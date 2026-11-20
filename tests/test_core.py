@@ -1067,5 +1067,75 @@ class TestSemantic(unittest.TestCase):
         self.assertNotEqual(harness.load_index().get("embed_model"), "fake-embed")
 
 
+class TestJournalRecall(unittest.TestCase):
+    """压缩掉的对话原文必须还能被检索到——不然「永久记忆」只是存着够不着。"""
+
+    def setUp(self):
+        reset()
+        os.makedirs(harness.JOURNAL_DIR, exist_ok=True)
+        harness._journal_write("c1", "用户: 那个便宜方案最后定了 PostgreSQL，一个月 30 块\n助手: 记下了")
+        harness._journal_write("c2", "用户: 明天要交周报\n助手: 好")
+        harness.load_journal_index(force=True)
+
+    def test_compacted_dialogue_is_searchable(self):
+        r = harness.retrieve("PostgreSQL 便宜方案")
+        self.assertIn("c1", r["blocks"], r.get("journal"))
+        self.assertIn("PostgreSQL", r["journal"])
+        self.assertIn("c1", r["journal"])
+
+    def test_unrelated_block_not_dragged_in(self):
+        r = harness.retrieve("PostgreSQL 便宜方案")
+        self.assertNotIn("c2", r["blocks"])
+
+    def test_journal_index_rebuilds_after_new_block(self):
+        before = harness.load_journal_index()
+        harness._journal_write("c3", "用户: 顺便说下 GPU 温度有点高\n助手: 好")
+        after = harness.load_journal_index()
+        self.assertNotEqual(before["signature"], after["signature"])
+        self.assertIn("c3", [e["block"] for e in after["entries"]])
+
+    def test_journal_hits_sit_beside_memories(self):
+        harness.save_memory("写周报", "每周五行", "project", "周报默认在周五下午交。")
+        r = harness.retrieve("周报 PostgreSQL 便宜方案")
+        self.assertEqual(r["tier"], "digest")       # 记忆库也有命中
+        self.assertIn("写周报", r["names"])
+        self.assertIn("c1", r["blocks"])            # 原文块照样带进来
+
+
+class TestSummaryTiering(unittest.TestCase):
+    """摘要要做二级压缩：prompt 里的摘要稿不能无限长，原文块一个字都不删。"""
+
+    def setUp(self):
+        reset()
+        os.makedirs(harness.JOURNAL_DIR, exist_ok=True)
+
+    def test_long_summary_gets_tiered(self):
+        summary = "".join("- [c%d] 第 %d 块：决定用 X%d，理由是便宜。\n" % (i, i, i)
+                          for i in range(1, 31))
+        s = harness.ChatSession(budget=8000, summary=summary)
+        self.assertTrue(s.tier_summary())
+        lines = [l for l in s.summary.splitlines() if l.strip()]
+        self.assertLessEqual(len(lines), harness.SUMMARY_KEEP_LINES + 1)
+        self.assertIn("–", lines[0])
+        self.assertIn("c1", lines[0])
+
+    def test_short_summary_left_alone(self):
+        s = harness.ChatSession(budget=8000, summary="- [c1] 一句话\n- [c2] 两句话\n")
+        self.assertFalse(s.tier_summary())
+        self.assertEqual(s.summary, "- [c1] 一句话\n- [c2] 两句话\n")
+
+    def test_tiering_keeps_recent_lines_verbatim(self):
+        summary = "".join("- [c%d] 第 %d 块要点\n" % (i, i) for i in range(1, 26))
+        s = harness.ChatSession(budget=8000, summary=summary)
+        s.tier_summary()
+        self.assertIn("- [c25] 第 25 块要点", s.summary)
+
+    def test_prepare_caps_oversized_summary(self):
+        s = harness.ChatSession(budget=8000, summary="- [c1] " + "长" * 9000)
+        msgs, _, _ = s.prepare("你好")
+        self.assertLess(len(msgs[0]["content"]), 9000)
+        self.assertIn("已折叠", msgs[0]["content"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

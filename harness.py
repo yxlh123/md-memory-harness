@@ -36,7 +36,7 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.13.0"
+VERSION = "2.14.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
 
@@ -803,7 +803,13 @@ def retrieve(question, budget_chars=None):
     budget_chars = budget_chars or int(CFG.get("retrieve_budget") or 6000)
     idx = load_index()
     if not idx["entries"]:
-        return {"text": "", "tier": "empty", "names": [], "count": 0}
+        # 记忆库是空的，但压缩掉的对话也许还有用
+        jtext, jblocks = _journal_hits(question)
+        if jtext:
+            return {"text": "", "tier": "journal", "names": [], "count": 0,
+                    "journal": jtext, "blocks": jblocks}
+        return {"text": "", "tier": "empty", "names": [], "count": 0,
+                "journal": "", "blocks": []}
 
     ranked = rank_entries(question, idx)
     if ranked and ranked[0][0] >= 0.5:
@@ -833,8 +839,10 @@ def retrieve(question, budget_chars=None):
     text = header + "\n\n".join(parts) if parts else ""
     names = [e["name"] for e in picked[:len(parts)]]
     touch_usage(names)
+    # 压缩掉的对话原文：跟记忆一起给模型，别让「上周定的方案」只存在于人脑子里
+    jtext, jblocks = _journal_hits(question, budget_chars=max(600, budget_chars - used))
     return {"text": text, "tier": tier, "names": names,
-            "count": len(parts)}
+            "count": len(parts), "journal": jtext, "blocks": jblocks}
 
 
 def memory_corpus(question, max_items=6, budget=30000):
@@ -844,10 +852,15 @@ def memory_corpus(question, max_items=6, budget=30000):
 
 
 def print_search(query):
-    """有索引的搜索：按命中率排序，打印命中的行。"""
+    """有索引的搜索：按命中率排序，打印命中的行。记忆库没有时也翻压缩掉的原文。"""
     idx = load_index()
     ranked = rank_entries(query, idx)
     if not ranked:
+        jtext, jblocks = _journal_hits(query)
+        if jtext:
+            print("（记忆库没有匹配，但压缩掉的对话里有）\n" + jtext)
+            print(f"\n原文在 {JOURNAL_DIR}，用 log show <块号> 看全文")
+            return
         print("（本地没有匹配；也可以直接问模型：python harness.py ask …）")
         return
     qt = tokenize(query)
@@ -859,6 +872,9 @@ def print_search(query):
                 print(f"       > {line.strip()[:100]}")
                 break
     print(f"\n命中 {len(ranked)} 条，索引：{IDX_FILE}")
+    jtext, jblocks = _journal_hits(query)
+    if jtext:
+        print("\n压缩掉的对话里也有：\n" + jtext)
 
 
 # ---------- LLM 调用 ----------
@@ -1198,7 +1214,132 @@ def list_journal():
                   key=lambda s: (len(s), s))
 
 
+JOURNAL_INDEX = ".journal-index.json"
+
+
+def _journal_index_path():
+    return os.path.join(JOURNAL_DIR, JOURNAL_INDEX)
+
+
+def _journal_sig():
+    """块文件的签名：新增/追加块时变化，没变就直接用缓存索引。"""
+    if not os.path.isdir(JOURNAL_DIR):
+        return ""
+    parts = []
+    for f in sorted(os.listdir(JOURNAL_DIR)):
+        if not f.endswith(".md") or f.startswith("."):
+            continue
+        try:
+            parts.append("%s:%d" % (f, os.path.getsize(os.path.join(JOURNAL_DIR, f))))
+        except OSError:
+            continue
+    return "|".join(parts)
+
+
+def build_journal_index():
+    """给 journal/ 里的原文块也建一份索引——压缩掉的内容不能只靠人手动 log show。"""
+    entries, df = [], {}
+    for block in list_journal():
+        try:
+            text = _read_text_file(_journal_path(block))
+        except OSError:
+            continue
+        toks = sorted(tokenize(text))
+        entries.append({"block": block, "tokens": toks})
+        for t in set(toks):
+            df[t] = df.get(t, 0) + 1
+    idx = {"version": INDEX_SCHEMA, "signature": _journal_sig(),
+           "n": len(entries), "df": df, "entries": entries}
+    if os.path.isdir(JOURNAL_DIR):
+        try:
+            _atomic_write(_journal_index_path(), json.dumps(idx, ensure_ascii=False, indent=1))
+        except OSError:
+            pass
+    return idx
+
+
+def load_journal_index(force=False):
+    path = _journal_index_path()
+    if not force and os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                idx = json.load(f)
+            if (idx.get("version") == INDEX_SCHEMA
+                    and idx.get("signature") == _journal_sig()
+                    and isinstance(idx.get("df"), dict)):
+                return idx
+        except Exception:
+            pass
+    return build_journal_index()
+
+
+def rank_journal(question, idx=None, limit=2, min_score=0.35):
+    """按 IDF 加权给原文块打分。门槛比记忆高，避免把旧对话硬塞进上下文。"""
+    idx = idx or load_journal_index()
+    if not idx.get("entries"):
+        return []
+    q = tokenize(question)
+    if not q:
+        return []
+    idf = _idf(idx)
+    known = {t: idf(t) for t in q if idx["df"].get(t)}
+    total = sum(known.values())
+    if not total:
+        return []
+    out = []
+    for e in idx["entries"]:
+        hit = set(known) & set(e["tokens"])
+        if not hit:
+            continue
+        score = sum(known[t] for t in hit) / total
+        if score >= min_score:
+            out.append((round(min(score, 1.5), 3), e))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out[:limit]
+
+
+def _journal_snippet(block, question, width=160):
+    """在原文块里找命中词所在的那一行，截一小段返回。"""
+    try:
+        text = _read_text_file(_journal_path(block))
+    except OSError:
+        return ""
+    lines = [l.strip() for l in text.splitlines()
+             if l.strip() and not l.startswith("#") and not l.startswith(">")]
+    q = tokenize(question)
+    best, best_hit = "", set()
+    for line in lines:
+        hit = tokenize(line) & q
+        if len(hit) > len(best_hit):
+            best, best_hit = line, hit
+    if not best:
+        best = lines[0] if lines else ""
+    if len(best) > width:
+        best = best[:width] + "…"
+    return best
+
+
+def _journal_hits(question, budget_chars=1200):
+    """返回 (文本, 块号列表)。没有命中就是空。"""
+    ranked = rank_journal(question)
+    text, blocks, used = "", [], 0
+    for score, e in ranked:
+        snip = _journal_snippet(e["block"], question)
+        if not snip:
+            continue
+        line = "· [%s] %s（%.2f）" % (e["block"], snip, score)
+        if used + len(line) > budget_chars:
+            break
+        text += (("\n" if text else "") + line)
+        blocks.append(e["block"])
+        used += len(line)
+    return text, blocks
+
+
 SUMMARY_FILE = ".summary.md"
+SUMMARY_MAX_LINES = 20      # 摘要行数超过这个就做二级压缩
+SUMMARY_KEEP_LINES = 12     # 二级压缩后保留最近几块的原样摘要
+SUMMARY_CAP = 6000          # 写进 prompt 的摘要字符上限（更早的折叠掉，原文仍在 journal）
 
 
 def summary_path():
@@ -1318,6 +1459,16 @@ def summarize_text(text, max_chars=400):
     return _local_summary(text, max_chars)
 
 
+def _block_span(lines):
+    """从摘要行里取块号范围：`- [c1] …` / `- [c1–c12] …` → ("c1", "c12")。"""
+    nums = []
+    for line in lines:
+        nums.extend(int(n) for n in re.findall(r"c(\d+)", line))
+    if not nums:
+        return None, None
+    return "c%d" % min(nums), "c%d" % max(nums)
+
+
 class ChatSession:
     """一次对话的上下文管理：超预算就把最早的几轮压成摘要，原文进 journal/。"""
 
@@ -1366,6 +1517,25 @@ class ChatSession:
         self.blocks.append(block)
         self.summary += f"- [{block}] {summarize_text(text)}\n"
         save_summary(self.summary)          # 摘要落盘：网页关了、进程重启了都能捡回来
+        self.tier_summary()                 # 摘要也不能无限长——老的合成一句，原文还在 journal
+        return True
+
+    def tier_summary(self):
+        """摘要行数太多时，把最老的一批合成一行（二级压缩）。
+
+        「永久记忆」指的是 memories/ 和 journal/ 里的原文——它们一个字都不删；
+        这里压的只是每轮都要塞进 prompt 的那份摘要稿。
+        """
+        lines = [l.rstrip() for l in self.summary.splitlines() if l.strip()]
+        if len(lines) <= SUMMARY_MAX_LINES:
+            return False
+        cut = len(lines) - SUMMARY_KEEP_LINES
+        old, keep = lines[:cut], lines[cut:]
+        merged = summarize_text("\n".join(old), max_chars=300)
+        first, last = _block_span(old)
+        tag = f"{first}–{last}" if first and last else f"前 {len(old)} 块"
+        self.summary = "\n".join([f"- [{tag}] {merged}"] + keep) + "\n"
+        save_summary(self.summary)
         return True
 
     # -- 提问 --
@@ -1375,8 +1545,14 @@ class ChatSession:
         sys_prompt = CHAT_SYS
         if r["text"]:
             sys_prompt += f"\n\n# 本地记忆（{r['tier']} 级，{r['count']} 条）\n{r['text']}"
+        if r.get("journal"):
+            sys_prompt += ("\n\n# 较早对话的原文片段（压缩前的原话，和摘要冲突时以这里为准）\n"
+                           + r["journal"])
         if self.summary:
-            sys_prompt += f"\n\n# 较早对话的摘要（原文可用 `log show <块号>` 回读）\n{self.summary}"
+            summary = self.summary
+            if len(summary) > SUMMARY_CAP:
+                summary = "（更早的摘要已折叠，原文在 journal/）\n" + summary[-SUMMARY_CAP:]
+            sys_prompt += f"\n\n# 较早对话的摘要（原文可用 log show <块号> 回读）\n{summary}"
         content = question
         if images:
             parts = [{"type": "text", "text": question}]

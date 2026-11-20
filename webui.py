@@ -218,9 +218,11 @@ def handle_api(path, body):
     if path == "/api/search":
         q = body.get("query", "").strip()
         ranked = harness.rank_entries(q)
+        jtext, jblocks = harness._journal_hits(q)
         return {"results": [{"score": s, "name": e["name"], "type": e.get("type", "?"),
                              "description": e.get("description", "")}
-                            for s, e in ranked[:20]]}
+                            for s, e in ranked[:20]],
+                "journal_text": jtext, "journal_blocks": jblocks}
 
     if path == "/api/model":
         try:

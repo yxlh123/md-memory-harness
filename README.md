@@ -246,6 +246,7 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
    - `snippet`（有命中但最高分 < 0.5）：摘要 + 命中词附近的原文片段，最多 6 条；
    - `recent`（一条都没命中）：只给最近 8 条，开头明确写"没检索到直接相关的记忆"。
 5. 总量受 `retrieve_budget` 限制（默认 6000 字符），超了按分数从低往高砍。
+6. **压缩掉的对话也会被搜**（v2.14.0 起）：`journal/*.md` 单独建一份索引（`journal/.journal-index.json`，同样按 IDF 打分），问"上周那个方案"时命中就摘一段原文（`· [c2] … （0.83）`）一起塞进 prompt，并标注"和摘要冲突时以原文为准"。记忆库一条都没命中、但原文里有时，也照样能捞出来。
 
 这样"记忆库很大"和"prompt 很小"就不冲突了：库多大都行，进 prompt 的永远是相关的那一小撮。
 
@@ -283,6 +284,8 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
   2. 让模型压成 3 行以内的要点（保留结论、决定及理由、路径/命令/数字），失败则退化为"保留头 70% + 尾 30% 字符"的本地摘要；
   3. 摘要以 `- [c1] …` 的形式追加到 `summary`，拼进 system prompt，并**原子写进 `journal/.summary.md`**；
 - 摘要里的块号永远指向真实文件：`python harness.py log show c1` 能看回原文。**摘要是有损的，但原文没丢。**
+- **摘要有二级压缩**（v2.14.0 起）：摘要超过 20 行时，把最老的若干行再合成一行（`- [c1–c12] …`，块号区间保留），只留最近 12 行原样。为什么：摘要每一轮都要拼进 system prompt，它自己是会长胖的——16K 上下文里记忆 6000 字 + 历史 8000 字之后只剩约 6700 token，每块摘要约 40 token，攒到一百多块就开始挤。压的只是"每轮要发出去的那份摘要稿"，`journal/` 里的原文一个字不删，而且能被检索命中。
+- **摘要和原文都能被检索到**（见上节第 6 条）：`retrieve()` 同时查记忆索引和对话原文索引，命中原文时按原话片段给模型。
 
 网页端把 `history` / `summary` / `blocks` 放在浏览器里来回传，所以刷新之前上下文不会丢；服务端每次都做同样的压缩判断。浏览器刷新或换台设备打开时，`history` 是空的，服务端会把磁盘里的 `journal/.summary.md` 和已有块号捡回来（`ChatSession.from_state`），接着上次的摘要往下聊——压缩过的内容不会因为关了网页就白压。
 
@@ -294,6 +297,7 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 | 压缩摘要索引 | `journal/.summary.md` | **自动**（每次压缩后原子写；重开会话自动读回） |
 | 图片 | `journal/images/<时间>-<随机>.png` | **自动**（发图时落盘，md 里只留路径） |
 | 检索索引 | `memories/.index.json` | **自动**（惰性重建：记忆文件变了、或签名对不上就重扫） |
+| 对话原文索引 | `journal/.journal-index.json` | **自动**（新块出现就重建；只存词元与位置，不存正文） |
 | 记忆条目 | `memories/<名字>.md` | `auto_save=auto` 时**自动**（每轮判断一次）；`suggest` 时先问你；`off` 时纯手动 |
 | 记忆总览 | `memories/MEMORY.md` | **自动**（增删记忆时重建，只给人看） |
 
@@ -373,7 +377,7 @@ python harness.py consolidate --no-llm           # 只聚类，不让模型判�
 ## 开发
 
 ```bash
-python -m unittest discover -s tests -v     # 77 个用例，不联网
+python -m unittest discover -s tests -v     # 85 个用例，不联网
 python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM 路径
 ```
 
@@ -381,7 +385,7 @@ python tests/mock_llm.py 8791               # 起一个假模型，验证 LLM �
 
 ## 下一步（还没做）
 
-排期见 [ROADMAP.md](ROADMAP.md)：memories 目录 git 化、网页管理面。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）、可选语义检索 embedding（v2.12.0）、语义检索开关 + 虚词过滤（v2.13.0）。
+排期见 [ROADMAP.md](ROADMAP.md)：memories 目录 git 化、网页管理面。已完成：TF-IDF 检索加权（v2.6.0）、流式输出（v2.7.0）、记忆元数据补全（v2.8.0）、supersede 版本机制（v2.9.0）、记忆合并/冲突处理 consolidate（v2.10.0）、token 用量统计（v2.11.0）、可选语义检索 embedding（v2.12.0）、语义检索开关 + 虚词过滤（v2.13.0）、压缩对话可检索 + 摘要分层（v2.14.0）。
 
 ## 许可
 
