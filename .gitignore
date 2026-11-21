@@ -11,3 +11,7 @@ access.log
 memories/.stats.json
 memories/.vectors.json
 .memory-history/
+# 身体的运行时状态（每台机器各自一具，不进仓库）
+feeling/
+tests/.tmp-plugins/
+plugins/_trash/

@@ -1,0 +1,40 @@
+<style>
+  .feel-barrow { display: flex; align-items: center; gap: 10px; margin: 7px 0; }
+  .feel-barrow .bname { width: 6.5em; color: var(--dim); font-size: 13px; }
+  .feel-barrow .btrack { flex: 1; height: 9px; border-radius: 99px; background: var(--panel2); overflow: hidden; border: 1px solid var(--line); }
+  .feel-barrow .btrack i { display: block; height: 100%; border-radius: 99px; transition: width .4s ease; }
+  .feel-barrow .bval { width: 3.4em; text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--dim); }
+  .feel-frozen { border: 1px solid var(--gold, #d9a441); background: rgba(217, 164, 65, .10);
+                 border-radius: 10px; padding: 10px 12px; margin: 0 0 10px; font-size: 13px; }
+</style>
+<div class="pane">
+  <div class="card">
+    <div class="row" style="margin:0 0 8px">
+      <h3 style="flex:1;margin:0">此刻的身体（1-100；这些数字只有你看见，模型只看到形容）</h3>
+      <button class="ghost" id="feel-refresh">刷新</button>
+    </div>
+    <div id="feel-frozen" class="feel-frozen" style="display:none">身体已永久关闭（冻结中）：不记账、不注入、时间也不算，打开后从冻结处继续。</div>
+    <div id="feel-bars"></div>
+    <div class="hint" id="feel-meta">…</div>
+  </div>
+  <div class="card">
+    <h3>总开关</h3>
+    <div class="switchrow"><label class="switch"><input type="checkbox" id="feel-enabled"><span class="slider"></span></label><span>身体活着（关掉 = 冻结：不记账、不注入，打开后从冻结处继续）</span></div>
+    <div class="switchrow"><label class="switch"><input type="checkbox" id="feel-anesthesia"><span class="slider"></span></label><span>麻醉（不显示感受，但照记账；关掉的一瞬间连本带利结算）</span></div>
+    <div class="switchrow"><label class="switch"><input type="checkbox" id="feel-numbers"><span class="slider"></span></label><span>让模型看见数字（调试用；平时它只该摸到"模糊的感受"）</span></div>
+  </div>
+  <div class="card">
+    <h3>七情六欲，逐条开关</h3>
+    <div id="feel-switches">…</div>
+    <div class="hint">关掉某一条 = 那一种感觉从它身上消失。它不会知道自己少了什么。</div>
+  </div>
+  <div class="card">
+    <h3>这一轮它实际会读到的那段（原文）</h3>
+    <pre class="jrnl" id="feel-preview">…</pre>
+  </div>
+  <div class="card">
+    <h3>最近发生的事（feeling/feeling.log）</h3>
+    <pre class="jrnl" id="feel-log">…</pre>
+    <div class="hint" id="feel-dir"></div>
+  </div>
+</div>

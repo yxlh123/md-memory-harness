@@ -430,6 +430,36 @@ class TestModelSwitch(unittest.TestCase):
             harness.set_model("")
         self.assertEqual(harness.MODEL, self.old_model)
 
+    def test_switch_carries_provider_base_url(self):
+        """每条模型自带 base_url：切模型时地址要跟着换，不能还打上一家的接口。"""
+        old_url = harness.BASE_URL
+        try:
+            harness.MODELS = [
+                {"id": "a", "label": "a", "base_url": "http://a.example/v1"},
+                {"id": "b", "label": "b", "base_url": "http://b.example/v1"},
+            ]
+            harness.MODEL = "a"
+            harness.BASE_URL = "http://a.example/v1"
+            harness.set_model("b")
+            self.assertEqual(harness.MODEL, "b")
+            self.assertEqual(harness.BASE_URL, "http://b.example/v1")
+            harness.set_model("a")
+            self.assertEqual(harness.BASE_URL, "http://a.example/v1")
+        finally:
+            harness.BASE_URL = old_url
+
+    def test_legacy_list_inherits_global_base_url(self):
+        """老配置（裸 id、地址全局）洗出来每条都要有 base_url，否则切了地址不跟。"""
+        models = harness._norm_models(["x", "y"], "x", "http://z.example/v1")
+        self.assertTrue(all(m.get("base_url") == "http://z.example/v1" for m in models))
+
+    def test_cannot_remove_model_in_use(self):
+        with self.assertRaises(ValueError):
+            harness.remove_model(harness.MODEL)
+        harness.add_model("spare-model", "备用", "http://spare.example/v1")
+        harness.remove_model("spare-model")
+        self.assertNotIn("spare-model", [m["id"] for m in harness.MODELS])
+
 
 class TestAutoCapture(unittest.TestCase):
     """自动捕获记忆：auto 直接存、suggest 只给候选、off 不打扰。"""

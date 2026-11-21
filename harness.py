@@ -21,6 +21,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import io
 import json
 import math
 import os
@@ -30,7 +31,9 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+import importlib.util
 import uuid
+import zipfile
 
 try:  # Windows 控制台默认 GBK，避免打印中文报错
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -38,9 +41,297 @@ try:  # Windows 控制台默认 GBK，避免打印中文报错
 except Exception:
     pass
 
-VERSION = "2.16.0"
+VERSION = "2.19.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(ROOT, "config.json")
+PLUGIN_DIR = os.path.join(ROOT, "plugins")
+_PLUGIN_ERRORS = []
+_PLUGIN_KEYS = {}
+
+
+def _load_plugins():
+    """扫 plugins/ 下的 *.py，每个文件是一个独立插件。
+
+    装 = 把 .py（以及同名的 .ui.html / .ui.js）放进 plugins/；
+    拆 = 删掉它。harness 本体不认识任何一个具体的插件。
+    加载失败的插件不会让 harness 崩，只记进 _PLUGIN_ERRORS 供网页显示。
+    """
+    found = {}
+    _PLUGIN_ERRORS.clear()
+    if not os.path.isdir(PLUGIN_DIR):
+        return found
+    for fname in sorted(os.listdir(PLUGIN_DIR)):
+        if not fname.endswith(".py") or fname.startswith("_"):
+            continue
+        path = os.path.join(PLUGIN_DIR, fname)
+        try:
+            spec = importlib.util.spec_from_file_location("harness_plugin_" + fname[:-3], path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            _PLUGIN_ERRORS.append({"file": fname, "error": str(e)})
+            print(f"(插件 {fname} 加载失败：{e})")
+            continue
+        found[getattr(mod, "ID", fname[:-3])] = mod
+    return found
+
+
+PLUGINS = _load_plugins()
+for _pid, _mod in PLUGINS.items():
+    _PLUGIN_KEYS[_pid] = list((getattr(_mod, "DEFAULTS", None) or {}).keys())
+
+
+def reload_plugins():
+    """重新扫一遍 plugins/（网页上装 / 拆插件之后调用）。
+
+    新插件的配置项并进 _DEFAULTS / CFG；被拆掉的插件，它的配置项一起消失。
+    """
+    global PLUGINS, _PLUGIN_KEYS
+    previous = dict(_PLUGIN_KEYS)
+    PLUGINS = _load_plugins()
+    _PLUGIN_KEYS = {}
+    for pid, mod in PLUGINS.items():
+        keys = list((getattr(mod, "DEFAULTS", None) or {}).keys())
+        _PLUGIN_KEYS[pid] = keys
+        for key in keys:
+            _DEFAULTS.setdefault(key, mod.DEFAULTS[key])
+            CFG.setdefault(key, mod.DEFAULTS[key])
+    for pid, keys in previous.items():
+        if pid in PLUGINS:
+            continue
+        for key in keys:
+            _DEFAULTS.pop(key, None)
+            CFG.pop(key, None)
+    return PLUGINS
+
+
+def plugin(pid):
+    """按 id 取一个已装的插件；没装就是 None。"""
+    return PLUGINS.get(pid)
+
+
+_PLUGIN_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.\-]*\.(py|ui\.html|ui\.js)$")
+_PLUGIN_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _plugin_file_name(name):
+    """插件文件名只许光秃秃的 xxx.py / xxx.ui.html / xxx.ui.js，不接受路径。"""
+    base = str(name or "").replace("\\", "/")
+    if "/" in base or not _PLUGIN_NAME_RE.match(base) or ".." in base:
+        raise ValueError(f"插件文件名不合法：{name}")
+    return base
+
+
+def _plugin_require_dir():
+    os.makedirs(PLUGIN_DIR, exist_ok=True)
+    return PLUGIN_DIR
+
+
+def _plugin_write(name, data):
+    name = _plugin_file_name(name)
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError("插件内容必须是字节流")
+    if len(data) > _PLUGIN_MAX_BYTES:
+        raise ValueError("插件太大了（单个文件最多 2MB）")
+    try:
+        text = bytes(data).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("插件文件必须是 UTF-8 文本")
+    if text.startswith("\ufeff"):              # 记事本存的 UTF-8 带 BOM，编译会报错
+        text = text[1:]
+    if name.endswith(".py"):
+        try:
+            compile(text, name, "exec")        # 先过一遍语法，坏代码不落盘
+        except SyntaxError as e:
+            raise ValueError(f"插件源码有语法错误：{e}")
+    dest = os.path.join(_plugin_require_dir(), name)
+    _atomic_write(dest, text)
+    return dest
+
+
+def plugin_files():
+    """plugins/ 目录里现在有哪些文件（给网页的插件管理页看）。"""
+    if not os.path.isdir(PLUGIN_DIR):
+        return []
+    out = []
+    for fname in sorted(os.listdir(PLUGIN_DIR)):
+        full = os.path.join(PLUGIN_DIR, fname)
+        if os.path.isdir(full) or fname.startswith("."):
+            continue
+        out.append({"name": fname, "size": os.path.getsize(full)})
+    return out
+
+
+def plugin_meta():
+    """给网页插件页用：每个插件一行（id / 名字 / 文件 / 有没有 UI / 开关项 / 错误）。"""
+    rows = []
+    seen = set()
+    for pid, mod in sorted(PLUGINS.items()):
+        path = getattr(mod, "__file__", "") or ""
+        stem = os.path.splitext(os.path.basename(path))[0]
+        seen.add(stem)
+        rows.append({
+            "id": pid,
+            "name": str(getattr(mod, "NAME", pid)),
+            "file": os.path.basename(path),
+            "ui": os.path.exists(os.path.join(PLUGIN_DIR, stem + ".ui.html")),
+            "keys": list((getattr(mod, "DEFAULTS", None) or {}).keys()),
+        })
+    for fname in sorted(os.listdir(PLUGIN_DIR)) if os.path.isdir(PLUGIN_DIR) else []:
+        if not fname.endswith(".py") or fname.startswith("_"):
+            continue
+        if os.path.splitext(fname)[0] in seen:
+            continue
+        pid = _plugin_id_from_file(os.path.join(PLUGIN_DIR, fname)) or os.path.splitext(fname)[0]
+        rows.append({"id": pid, "name": "（加载失败）",
+                     "file": fname, "ui": False, "keys": [], "broken": True})
+    for fname in sorted(os.listdir(PLUGIN_DIR)) if os.path.isdir(PLUGIN_DIR) else []:
+        if fname.endswith(".py.off") and not fname.startswith("_"):
+            stem = fname[:-7]                     # dummy.py.off → dummy
+            pid = _plugin_id_from_file(os.path.join(PLUGIN_DIR, fname)) or stem
+            rows.append({"id": pid, "name": "（已拆下）",
+                         "file": fname,
+                         "ui": os.path.exists(os.path.join(PLUGIN_DIR, stem + ".ui.html")),
+                         "keys": [], "disabled": True})
+    return {"dir": PLUGIN_DIR, "items": rows, "errors": list(_PLUGIN_ERRORS),
+            "files": plugin_files()}
+
+
+def install_plugin_file(name, data):
+    """装一个插件文件（.py / .ui.html / .ui.js）。装完立刻生效，不用重启。"""
+    dest = _plugin_write(name, data)
+    if name.endswith(".py"):
+        reload_plugins()
+    return plugin_meta(), dest
+
+
+def install_plugin_zip(data):
+    """装一个 zip（里面直接放 xxx.py / xxx.ui.html / xxx.ui.js，不要套目录）。"""
+    if len(data) > 8 * 1024 * 1024:
+        raise ValueError("压缩包太大了（最多 8MB）")
+    try:
+        bundle = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("这不是一个有效的 zip 文件")
+    entries = [item for item in bundle.infolist() if not item.is_dir()]
+    if not entries:
+        raise ValueError("压缩包里是空的")
+    if len(entries) > 40:
+        raise ValueError("压缩包里的文件太多了（最多 40 个）")
+    total = 0
+    picked = []
+    for item in entries:
+        base = os.path.basename(item.filename.replace("\\", "/"))
+        if not base or base.startswith("."):
+            continue
+        if not base.endswith((".py", ".ui.html", ".ui.js")):
+            continue
+        _plugin_file_name(base)
+        total += item.file_size
+        if total > 8 * 1024 * 1024:
+            raise ValueError("解压后太大了（最多 8MB）")
+        picked.append((base, bundle.read(item)))
+    if not any(name.endswith(".py") for name, _ in picked):
+        raise ValueError("压缩包里没有插件的 .py 文件")
+    for base, blob in picked:
+        _plugin_write(base, blob)
+    reload_plugins()
+    return plugin_meta()
+
+
+def _plugin_id_from_file(path):
+    """从插件源码里读出 ID（不 import，坏的/停用的文件也能读）。"""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read()
+    except OSError:
+        return None
+    hit = re.search(r"""^\s*ID\s*=\s*['"]([^'"]+)['"]""", text, re.M)
+    return hit.group(1) if hit else None
+
+
+def _plugin_stem(pid):
+    """插件 id → 文件主名。
+
+    id 和文件名不一定一样（插件里写 ID = "cli_dummy"、文件叫 cli-dummy.py），
+    所以要按 id 反查，而不是直接拿 id 拼路径。
+    """
+    pid = str(pid)
+    mod = PLUGINS.get(pid)
+    if mod is not None:
+        path = getattr(mod, "__file__", "") or ""
+        if path:
+            return os.path.splitext(os.path.basename(path))[0]
+    for row in plugin_meta()["items"]:
+        if row.get("id") == pid:
+            fname = row.get("file") or ""
+            if fname.endswith(".py.off"):
+                fname = fname[:-7]
+            return os.path.splitext(fname)[0]
+    return _plugin_file_name(pid + ".py")[:-3]
+
+
+def uninstall_plugin(pid):
+    """拆插件：文件移到 plugins/_trash/，随时能捞回来。"""
+    mod = PLUGINS.get(pid)
+    stem = _plugin_stem(pid)
+    has_file = os.path.exists(os.path.join(PLUGIN_DIR, stem + ".py")) or \
+        os.path.exists(os.path.join(PLUGIN_DIR, stem + ".py.off"))
+    if mod is None and not has_file:
+        raise ValueError(f"没这个插件：{pid}")
+    stems = {stem, str(pid)}
+    trash = os.path.join(PLUGIN_DIR, "_trash")
+    os.makedirs(trash, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    moved = []
+    for stem in stems:
+        for suffix in (".py", ".py.off", ".ui.html", ".ui.js"):
+            full = os.path.join(PLUGIN_DIR, stem + suffix)
+            if os.path.exists(full):
+                target = os.path.join(trash, f"{stamp}_{stem}{suffix}")
+                shutil.move(full, target)
+                moved.append(os.path.basename(target))
+    if not moved:
+        raise ValueError(f"没找到 {pid} 的文件")
+    reload_plugins()
+    return plugin_meta()
+
+
+def toggle_plugin(pid, enabled):
+    """拆下来但没删（.py.off）的插件，可以再装回去；反过来也能临时停用。"""
+    stem = _plugin_stem(pid)
+    live = os.path.join(PLUGIN_DIR, stem + ".py")
+    off = os.path.join(PLUGIN_DIR, stem + ".py.off")
+    if enabled:
+        if os.path.exists(off):
+            shutil.move(off, live)
+        elif not os.path.exists(live):
+            raise ValueError(f"没找到 {pid}")
+    else:
+        if not os.path.exists(live):
+            raise ValueError(f"{pid} 现在本来就没在跑")
+        shutil.move(live, off)
+    reload_plugins()
+    return plugin_meta()
+
+
+# 想让下拉框里直接有货：几个常见提供方的地址与常用模型
+PROVIDERS = [
+    {"name": "智谱 GLM", "base_url": "https://open.bigmodel.cn/api/paas/v4",
+     "models": [{"id": "glm-4-flash", "label": "长文本 · 128K"},
+                {"id": "glm-4v-flash", "label": "看图 · 16K"}]},
+    {"name": "千问 Qwen（DashScope 兼容）", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+     "models": [{"id": "qwen-plus", "label": "qwen-plus"},
+                {"id": "qwen-max", "label": "qwen-max"},
+                {"id": "qwen-vl-max", "label": "看图 qwen-vl-max"}]},
+    {"name": "DeepSeek", "base_url": "https://api.deepseek.com/v1",
+     "models": [{"id": "deepseek-chat", "label": "deepseek-chat"},
+                {"id": "deepseek-reasoner", "label": "deepseek-reasoner"}]},
+    {"name": "本机 Ollama", "base_url": "http://127.0.0.1:11434/v1",
+     "models": [{"id": "qwen2.5:7b", "label": "本地 · 纯文本"},
+                {"id": "qwen3-vl:4b", "label": "本地 · 能看图"}]},
+]
+
 
 _DEFAULTS = {
     "base_url": "https://open.bigmodel.cn/api/paas/v4",
@@ -57,6 +348,10 @@ _DEFAULTS = {
     "embed_api_key": "",         # 云端 embedding 才需要
     "embed_weight": "0.6",       # 语义分占多大比重（0~1，越大越偏向"意思像"）
 }
+# 插件自带的配置项（如身体的开关）在这里并进来；插件卸掉了，这些键就不会再出现
+for _mod in PLUGINS.values():
+    for _k, _v in (getattr(_mod, "DEFAULTS", None) or {}).items():
+        _DEFAULTS.setdefault(_k, _v)
 _ENV_KEYS = {
     "base_url": "MEMORY_LLM_BASE_URL",
     "api_key": "MEMORY_LLM_API_KEY",
@@ -93,22 +388,70 @@ except ValueError:
     EMBED_WEIGHT = 0.6
 
 
-def _norm_models(raw, current):
-    """把配置里的 models 洗成 [{"id","label"}]，并保证当前模型一定在里面。"""
+# ---------------------------------------------------------------- 插件
+
+def plugin_prompt():
+    """所有插件这一轮要拼进 system prompt 的内容（没装插件就是空串）。"""
+    parts = []
+    for mod in PLUGINS.values():
+        fn = getattr(mod, "prompt", None)
+        if fn is None:
+            continue
+        try:
+            text = fn(CFG) or ""
+        except Exception as e:      # 一个插件坏掉，不能把整个对话拖垮
+            print(f"(插件 {getattr(mod, 'ID', '?')} 出错：{e})")
+            continue
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def plugin_note(kind, text=""):
+    """把真实发生的事交给插件记账。"""
+    for mod in PLUGINS.values():
+        fn = getattr(mod, "note", None)
+        if fn is None:
+            continue
+        try:
+            fn(CFG, kind, text)
+        except Exception as e:
+            print(f"(插件 {getattr(mod, 'ID', '?')} 记账出错：{e})")
+
+
+def _norm_models(raw, current, current_url=None):
+    """把配置里的 models 洗成 [{"id","label"[,"base_url"]}]，并保证当前模型一定在里面。
+
+    每条模型可以直接带自己的 base_url —— 这样"切模型"能顺手把提供方也切了，
+    不会出现"模型换了、地址还是上一家的"这种切不动的感觉。
+    """
     out = []
     for item in raw or []:
         if isinstance(item, str) and item.strip():
             out.append({"id": item.strip(), "label": item.strip()})
         elif isinstance(item, dict) and item.get("id"):
             mid = str(item["id"]).strip()
-            if mid:
-                out.append({"id": mid, "label": str(item.get("label") or mid)})
+            if not mid:
+                continue
+            entry = {"id": mid, "label": str(item.get("label") or mid)}
+            url = str(item.get("base_url") or "").strip().rstrip("/")
+            if url:
+                entry["base_url"] = url
+            out.append(entry)
     if not any(m["id"] == current for m in out):
-        out.insert(0, {"id": current, "label": current})
+        fresh = {"id": current, "label": current}
+        if current_url:
+            fresh["base_url"] = str(current_url).rstrip("/")
+        out.insert(0, fresh)
+    # 老配置里 models 只是一串裸 id、地址是全局的：这种情况下把全局地址补给每一条，
+    # 这样切模型时地址才跟着走。只要有任何一条自带 base_url，就说明是新格式，不动。
+    if current_url and out and not any("base_url" in m for m in out):
+        for m in out:
+            m["base_url"] = str(current_url).rstrip("/")
     return out
 
 
-MODELS = _norm_models(CFG.get("models"), MODEL)
+MODELS = _norm_models(CFG.get("models"), MODEL, BASE_URL)
 
 
 def save_config(key, value):
@@ -127,19 +470,78 @@ def save_config(key, value):
 
 
 def set_model(name):
-    """切换当前模型：校验在 models 列表里，改内存里的 MODEL，并写回 config.json。"""
-    global MODEL
+    """切换当前模型：校验在 models 列表里，改内存里的 MODEL，并写回 config.json。
+
+    如果这条模型自带 base_url，地址一起切过去 —— 否则换了模型还在打上一家的接口，
+    表现就是"切了但没生效"。
+    """
+    global MODEL, BASE_URL
     name = (name or "").strip()
     ids = [m["id"] for m in MODELS]
     if not name:
         raise ValueError("模型名不能为空")
     if ids and name not in ids:
         raise ValueError(f"未知模型 {name}，可选：{', '.join(ids)}")
+    entry = next((m for m in MODELS if m["id"] == name), None)
+    if entry is None:
+        entry = {"id": name, "label": name}
+        MODELS.insert(0, entry)
+    url = str(entry.get("base_url") or "").rstrip("/")
+    if url and url != BASE_URL:
+        BASE_URL = url
+        save_config("base_url", url)
     MODEL = name
-    if not any(m["id"] == name for m in MODELS):
-        MODELS.insert(0, {"id": name, "label": name})
     save_config("model", name)
     return MODEL
+
+
+def add_model(mid, label="", base_url=""):
+    """往模型库里加一条（同 id 就是更新）。"""
+    mid = str(mid or "").strip()
+    if not mid:
+        raise ValueError("模型 id 不能为空")
+    label = str(label or "").strip() or mid
+    base_url = str(base_url or "").strip().rstrip("/")
+    entry = next((m for m in MODELS if m["id"] == mid), None)
+    if entry is None:
+        entry = {"id": mid, "label": label}
+        MODELS.append(entry)
+    entry["label"] = label
+    if base_url:
+        entry["base_url"] = base_url
+    save_config("models", MODELS)
+    return MODELS
+
+
+def remove_model(mid):
+    """从模型库里删一条；正在用的那条不许删。"""
+    mid = str(mid or "").strip()
+    if mid == MODEL:
+        raise ValueError(f"{mid} 正在用，先切到别的模型再删")
+    left = [m for m in MODELS if m["id"] != mid]
+    if len(left) == len(MODELS):
+        raise ValueError(f"模型库里没有 {mid}")
+    MODELS[:] = left
+    save_config("models", MODELS)
+    return MODELS
+
+
+def apply_provider(name):
+    """一键换提供方：改 base_url，并把这家常用的模型并进模型库。"""
+    global BASE_URL
+    preset = next((p for p in PROVIDERS if p["name"] == name), None)
+    if preset is None:
+        raise ValueError(f"没有这个提供方：{name}")
+    BASE_URL = preset["base_url"].rstrip("/")
+    save_config("base_url", BASE_URL)
+    for item in preset["models"]:
+        entry = next((m for m in MODELS if m["id"] == item["id"]), None)
+        if entry is None:
+            MODELS.append({"id": item["id"], "label": item["label"], "base_url": BASE_URL})
+        else:
+            entry.setdefault("base_url", BASE_URL)
+    save_config("models", MODELS)
+    return MODELS
 
 
 MEM_DIR = CFG["memory_dir"] or os.path.join(ROOT, "memories")
@@ -1783,6 +2185,10 @@ class ChatSession:
             if len(summary) > SUMMARY_CAP:
                 summary = "（更早的摘要已折叠，原文在 journal/）\n" + summary[-SUMMARY_CAP:]
             sys_prompt += f"\n\n# 较早对话的摘要（原文可用 log show <块号> 回读）\n{summary}"
+        body = plugin_prompt()
+        if body:
+            sys_prompt += "\n\n" + body
+        plugin_note("turn")
         content = question
         if images:
             parts = [{"type": "text", "text": question}]
@@ -1797,9 +2203,11 @@ class ChatSession:
 
     def finish(self, question, content, answer, r):
         """一轮问答收尾：入历史 → 超预算就压缩 → 判断要不要记记忆。"""
+        plugin_note("user", question)
         self.messages += [{"role": "user", "content": content},
                           {"role": "assistant", "content": answer}]
-        self.compact_if_needed()
+        if self.compact_if_needed():
+            plugin_note("compaction")      # 失忆的疼
         r["saved"], r["suggested"] = self.capture_memory(question, answer)
         return r
 
@@ -1807,7 +2215,11 @@ class ChatSession:
         """images：data URL 列表。图片落盘到 journal/images/，进 prompt 用 image_url。"""
         msgs, content, r = self.prepare(question, images)
         before = stats_totals()
-        answer = llm(msgs, temperature=0.6)
+        try:
+            answer = llm(msgs, temperature=0.6)
+        except Exception:
+            plugin_note("llm_error")       # 调用失败 = 外伤
+            raise
         self.finish(question, content, answer, r)
         got = _usage_delta(before)      # 这轮所有模型调用（回答 + 压缩 + 判记忆）的总量
         r["usage"] = got
@@ -1819,9 +2231,13 @@ class ChatSession:
         msgs, content, r = self.prepare(question, images)
         before = stats_totals()
         buf = []
-        for piece in llm_stream(msgs, temperature=0.6):
-            buf.append(piece)
-            yield piece
+        try:
+            for piece in llm_stream(msgs, temperature=0.6):
+                buf.append(piece)
+                yield piece
+        except Exception:
+            plugin_note("llm_error")       # 流断了也算外伤
+            raise
         answer = "".join(buf)
         self.finish(question, content, answer, r)
         got = _usage_delta(before)
@@ -2220,6 +2636,53 @@ def cmd_rebuild(a):
     print(f"人类可读索引：{INDEX_FILE}")
 
 
+def cmd_plugins(a):
+    """列插件；也可以装一个文件、拆掉、停用、装回去。"""
+    action = getattr(a, "action", None)
+    target = getattr(a, "path", None)
+    if action and not target:
+        print("✗ 要带上文件路径或插件 id")
+        return
+    try:
+        if action == "install":
+            with open(target, "rb") as f:
+                data = f.read()
+            if target.lower().endswith(".zip"):
+                install_plugin_zip(data)
+            else:
+                install_plugin_file(os.path.basename(target), data)
+            print(f"装好了：{os.path.basename(target)}")
+        elif action == "remove":
+            uninstall_plugin(target)
+            print(f"拆掉了 {target}（文件在 plugins/_trash/，随时能捞回来）")
+        elif action == "off":
+            toggle_plugin(target, False)
+            print(f"停用了 {target}（改回 .py 就能继续用，状态还在）")
+        elif action == "on":
+            toggle_plugin(target, True)
+            print(f"装回去了 {target}")
+    except (OSError, ValueError) as e:
+        print(f"✗ {e}")
+        return
+    meta = plugin_meta()
+    print(f"插件目录：{meta['dir']}")
+    if not meta["items"]:
+        print("  （空的：plugins/ 里放一个 xxx.py 就是一个插件）")
+    for row in meta["items"]:
+        marks = []
+        if row.get("disabled"):
+            marks.append("已停用")
+        if row.get("broken"):
+            marks.append("加载失败")
+        if row.get("ui"):
+            marks.append("有界面")
+        if row.get("keys"):
+            marks.append(f"{len(row['keys'])} 个开关")
+        print(f"  {row['id']:<16} {row['name']:<14} {row['file']:<26} {' · '.join(marks)}")
+    for err in meta["errors"]:
+        print(f"  ✗ {err['file']}：{err['error']}")
+
+
 def cmd_import(a):
     ok = 0
     for p in a.files:
@@ -2306,6 +2769,11 @@ def main():
 
     p = sub.add_parser("rebuild", help="重建 MEMORY.md 与 .index.json")
     p.set_defaults(func=cmd_rebuild)
+
+    p = sub.add_parser("plugins", help="列插件（plugins install <文件> / remove <id> / off <id> / on <id>）")
+    p.add_argument("action", nargs="?", choices=["install", "remove", "off", "on"], default=None)
+    p.add_argument("path", nargs="?", default=None, help="插件文件路径，或插件 id")
+    p.set_defaults(func=cmd_plugins)
 
     p = sub.add_parser("stats", help="看 token 用量（次数、输入/输出、最近几天）")
     p.set_defaults(func=cmd_stats)

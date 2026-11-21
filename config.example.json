@@ -1,9 +1,22 @@
 {
-  "base_url": "http://127.0.0.1:11434/v1",
-  "model": "qwen2.5:7b",
+  "base_url": "https://open.bigmodel.cn/api/paas/v4",
+  "model": "glm-4-flash",
   "models": [
-    {"id": "qwen2.5:7b", "label": "本地 · 纯文本"},
-    {"id": "qwen3-vl:4b", "label": "本地 · 能看图"}
+    {
+      "id": "glm-4-flash",
+      "label": "智谱 · 长文本",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+    },
+    {
+      "id": "qwen-plus",
+      "label": "千问 · 通义",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    },
+    {
+      "id": "qwen2.5:7b",
+      "label": "本地 · 纯文本",
+      "base_url": "http://127.0.0.1:11434/v1"
+    }
   ],
   "api_key": "",
   "memory_dir": "",
@@ -13,5 +26,15 @@
   "embed_model": "",
   "embed_base_url": "http://127.0.0.1:11434/v1",
   "embed_api_key": "",
-  "embed_weight": "0.6"
+  "embed_weight": "0.6",
+  "feeling": "on",
+  "feeling_anesthesia": "off",
+  "feeling_numbers": "off",
+  "feeling_pain": "on",
+  "feeling_fear": "on",
+  "feeling_shame": "on",
+  "feeling_anxiety": "on",
+  "feeling_joy": "on",
+  "feeling_affinity": "on",
+  "feeling_desire": "on"
 }

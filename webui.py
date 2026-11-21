@@ -10,6 +10,7 @@
 再把压缩后的 history / summary 传回去，所以刷新页面之前不会丢上下文。
 """
 import argparse
+import base64
 import importlib
 import json
 import os
@@ -98,6 +99,8 @@ def api_state():
         "blocks": harness.list_journal(),
         "auto_save": str(harness.CFG.get("auto_save") or "auto"),
         "embed_model": harness.EMBED_MODEL,      # 空 = 只用关键词检索
+        "providers": harness.PROVIDERS,          # 一键换提供方用
+        "plugins": harness.plugin_meta(),        # 已装插件 / 加载失败 / 可装
         "stats": harness.load_stats(),          # token 用量：总量 + 按天
     }
 
@@ -261,6 +264,55 @@ def handle_api(path, body):
             return api_error(str(e))
         return {"ok": True, "model": harness.MODEL, "state": api_state()}
 
+    if path == "/api/models":
+        action = str(body.get("action") or "")
+        try:
+            if action == "set":
+                harness.set_model(body.get("id") or body.get("model") or "")
+            elif action == "add":
+                harness.add_model(body.get("id"), body.get("label"), body.get("base_url"))
+            elif action == "remove":
+                harness.remove_model(body.get("id"))
+            elif action == "provider":
+                harness.apply_provider(str(body.get("name") or ""))
+            else:
+                return api_error("action 只能是 set / add / remove / provider")
+        except ValueError as e:
+            return api_error(str(e))
+        return {"ok": True, "state": api_state()}
+
+    if path == "/api/plugins/install":
+        name = str(body.get("name") or "").strip()
+        blob64 = body.get("data") or ""
+        if not name or not blob64:
+            return api_error("要带上插件文件名和数据")
+        try:
+            blob = base64.b64decode(str(blob64), validate=True)
+        except Exception:
+            return api_error("插件数据不是合法的 base64")
+        try:
+            if name.lower().endswith(".zip"):
+                meta = harness.install_plugin_zip(blob)
+            else:
+                meta, _ = harness.install_plugin_file(name, blob)
+        except ValueError as e:
+            return api_error(str(e))
+        return {"ok": True, "plugins": meta, "state": api_state()}
+
+    if path == "/api/plugins/uninstall":
+        try:
+            meta = harness.uninstall_plugin(str(body.get("id") or ""))
+        except ValueError as e:
+            return api_error(str(e))
+        return {"ok": True, "plugins": meta, "state": api_state()}
+
+    if path == "/api/plugins/toggle":
+        try:
+            meta = harness.toggle_plugin(str(body.get("id") or ""), bool(body.get("enabled")))
+        except ValueError as e:
+            return api_error(str(e))
+        return {"ok": True, "plugins": meta, "state": api_state()}
+
     if path == "/api/config":
         key, value = body.get("key", ""), body.get("value")
         if key not in harness._DEFAULTS or value is None:
@@ -282,6 +334,32 @@ def handle_api(path, body):
                               json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
         importlib.reload(harness)  # 新配置立即生效
         return {"ok": True, "state": api_state()}
+
+    if path.startswith("/api/plugin/"):
+        # 插件自己的开关：/api/plugin/<id>/switch，body {key, value}
+        parts = [p for p in path[len("/api/plugin/"):].split("/") if p]
+        pid = parts[0] if parts else ""
+        mod = harness.plugin(pid)
+        if mod is None:
+            return api_error("这个插件没装")
+        if len(parts) != 2 or parts[1] != "switch":
+            return api_error("未知的插件接口")
+        key, value = str(body.get("key", "")), str(body.get("value", ""))
+        allowed = getattr(mod, "DEFAULTS", None) or {}
+        if key not in allowed:
+            return api_error("不是这个插件的开关")
+        if value not in ("on", "off"):
+            return api_error("开关只能是 on / off")
+        cfg = {}
+        if os.path.exists(harness.CONFIG_FILE):
+            with open(harness.CONFIG_FILE, encoding="utf-8") as f:
+                cfg = json.load(f)
+        cfg[key] = value
+        harness._atomic_write(harness.CONFIG_FILE,
+                              json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+        harness.CFG[key] = value        # 立即生效；不 reload，插件内存里的身体不会重建
+        snap = mod.snapshot(harness.CFG) if hasattr(mod, "snapshot") else {}
+        return {"ok": True, "plugin": snap}
 
     return api_error("未知接口")
 
@@ -348,6 +426,34 @@ class Handler(BaseHTTPRequestHandler):
         with open(path, "rb") as f:
             self._send(200, ctype, f.read())
 
+    def _serve_plugin(self, rest):
+        """插件自己的东西：/api/plugin/<id>（状态）、/<id>/ui.html、/<id>/ui.js。"""
+        parts = [p for p in rest.split("/") if p]
+        pid = parts[0] if parts else ""
+        if not pid or os.path.basename(pid) != pid:
+            self._send(403, "text/plain; charset=utf-8", b"bad plugin id")
+            return
+        mod = harness.plugin(pid)
+        if mod is None:
+            self._json(api_error("这个插件没装"), 404)
+            return
+        if len(parts) == 1:
+            snap = mod.snapshot(harness.CFG) if hasattr(mod, "snapshot") else {}
+            self._json(snap)
+            return
+        want = parts[1]
+        if want not in ("ui.html", "ui.js"):
+            self._send(404, "text/plain; charset=utf-8", b"not found")
+            return
+        fp = os.path.join(harness.PLUGIN_DIR, pid + "." + want)
+        if not os.path.isfile(fp):
+            self._send(404, "text/plain; charset=utf-8", b"no ui")
+            return
+        ctype = ("text/html; charset=utf-8" if want == "ui.html"
+                 else "application/javascript; charset=utf-8")
+        with open(fp, encoding="utf-8") as f:
+            self._send(200, ctype, f.read().encode("utf-8"))
+
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
         path, query = parsed.path, parsed.query
@@ -372,6 +478,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json({"items": harness.journal_blocks(),
                             "summary": harness.load_summary()})
+        elif path == "/api/plugins":
+            self._json(harness.plugin_meta())
+        elif path.startswith("/api/plugin/"):
+            self._serve_plugin(path[len("/api/plugin/"):])
         elif path == "/api/images":
             self._json({"items": harness.list_images()})
         elif path.startswith("/images/"):

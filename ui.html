@@ -102,6 +102,9 @@
   .thumbs a { display: block; width: 96px; height: 96px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); }
   .thumbs img { width: 100%; height: 100%; object-fit: cover; display: block; }
   #toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--accent); color: var(--text); padding: 8px 18px; border-radius: 99px; display: none; }
+  /* 情绪页：七条 1-100 的条 */
+  .switchrow { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+  .switchrow span { font-size: 13px; }
 </style>
 </head>
 <body>
@@ -198,6 +201,32 @@
         </div>
         <div class="status" id="cfgstatus"></div>
       </div>
+
+      <div class="card">
+        <div class="row" style="margin:0 0 10px">
+          <h3 style="flex:1;margin:0">模型库</h3>
+          <button class="ghost" id="modelrefresh">刷新</button>
+        </div>
+        <div id="modellist"></div>
+        <div class="row" style="margin:12px 0 0">
+          <input id="newmodel_id" placeholder="模型 id，如 qwen-plus" style="flex:1">
+          <input id="newmodel_label" placeholder="备注（可选）" style="width:9em">
+          <input id="newmodel_base" placeholder="base_url（可选）" style="flex:1">
+          <button class="ghost" id="addmodel">添加</button>
+        </div>
+        <div class="hint" style="margin-top:8px">每条模型可以自带 base_url：切模型时地址一起切过去，不会出现「模型换了、地址还是上一家」。</div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="margin:0 0 10px">
+          <h3 style="flex:1;margin:0">插件</h3>
+          <button class="ghost" id="pluginrefresh">刷新</button>
+          <label class="ghost" for="pluginfile" style="cursor:pointer;margin:0">安装插件（.py / .zip）</label>
+          <input type="file" id="pluginfile" accept=".py,.zip,.html,.js" multiple style="display:none">
+        </div>
+        <div id="pluginlist"></div>
+        <div class="hint" id="plugindir"></div>
+      </div>
     </div>
   </section>
 
@@ -278,6 +307,8 @@ function renderAll() {
   $('#cfgstatus').textContent = '当前：' + state.model + '  ·  ' +
     (state.is_local ? '本地服务（免 Key）' : (state.has_key ? '云端（Key 已设置）' : '⚠ 云端但未设置 Key')) +
     '  ·  语义检索：' + (state.embed_model ? state.embed_model : '关');
+  renderModelList();
+  renderPluginList();
   renderMemories();
 }
 
@@ -291,10 +322,10 @@ function renderModelSelect() {
 $('#modelsel').onchange = async () => {
   const name = $('#modelsel').value;
   try {
-    const j = await api('/api/model', {model: name});
+    const j = await api('/api/models', {action: 'set', id: name});
     state = j.state;
     renderAll();
-    toast('已切换到 ' + name + '（已写进 config.json，命令行也用它）');
+    toast('已切换到 ' + name + '（' + state.base_url + '，已写进 config.json）');
   } catch (e) {
     toast('切换失败：' + e.message);
     renderModelSelect();
@@ -583,9 +614,23 @@ $('#importfile').onchange = async e => {
 };
 
 /* ---------- 配置 ---------- */
-document.querySelectorAll('.presets button').forEach(b => b.onclick = () => {
-  $('#cfg_base_url').value = b.dataset.bu;
-  if (b.dataset.m) $('#cfg_model').value = b.dataset.m;
+document.querySelectorAll('.presets button').forEach(b => b.onclick = async () => {
+  const bu = b.dataset.bu || '';
+  const mid = b.dataset.m || '';
+  $('#cfg_base_url').value = bu;
+  if (mid) $('#cfg_model').value = mid;
+  try {
+    // 换提供方 = 地址跟着换 + 模型进库 + 立刻切过去，一步到位
+    ({state} = await api('/api/config', {key: 'base_url', value: bu}));
+    if (mid) {
+      ({state} = await api('/api/models', {action: 'add', id: mid, label: b.textContent.trim(), base_url: bu}));
+      ({state} = await api('/api/models', {action: 'set', id: mid}));
+      toast('已换到 ' + b.textContent.trim() + '：' + mid);
+    } else {
+      toast('地址已切到 ' + bu + '，填个模型名再点保存');
+    }
+    renderAll();
+  } catch (e) { toast('切换失败：' + e.message); }
 });
 $('#savecfg').onclick = async () => {
   try {
@@ -602,6 +647,125 @@ $('#savecfg').onclick = async () => {
     setTimeout(() => $('#cfgmsg').textContent = '', 3000);
     renderAll();
   } catch (e) { $('#cfgmsg').textContent = '✗ ' + e.message; }
+};
+
+/* ---------- 模型库 ---------- */
+function renderModelList() {
+  const box = $('#modellist');
+  if (!box) return;
+  box.innerHTML = '';
+  (state.models || []).forEach(m => {
+    const isCur = m.id === state.model;
+    const sub = (m.base_url || state.base_url) + (isCur ? '  ·  正在用' : '');
+    const title = (m.label && m.label !== m.id) ? (m.label + '  ·  ' + m.id) : m.id;
+    const btns = [];
+    if (!isCur) btns.push(mkBtn('切到它', 'ghost sm', () => setModel(m.id)));
+    if ((state.models || []).length > 1) btns.push(mkBtn('删除', 'ghost sm', () => delModel(m.id)));
+    box.appendChild(opsRow(title, sub, btns));
+  });
+  if (!(state.models || []).length) box.appendChild(opsHint('还没有模型，下面加一个。'));
+}
+async function setModel(id) {
+  try {
+    const j = await api('/api/models', {action: 'set', id});
+    state = j.state;
+    renderAll();
+    toast('已切到 ' + id + '（' + state.base_url + '）');
+  } catch (e) { toast('切换失败：' + e.message); }
+}
+async function delModel(id) {
+  try {
+    const j = await api('/api/models', {action: 'remove', id});
+    state = j.state;
+    renderAll();
+    toast('已从模型库删掉 ' + id);
+  } catch (e) { toast('删除失败：' + e.message); }
+}
+$('#addmodel').onclick = async () => {
+  const id = $('#newmodel_id').value.trim();
+  if (!id) { toast('模型 id 不能为空'); return; }
+  try {
+    const j = await api('/api/models', {action: 'add', id,
+      label: $('#newmodel_label').value.trim(), base_url: $('#newmodel_base').value.trim()});
+    state = j.state;
+    $('#newmodel_id').value = ''; $('#newmodel_label').value = ''; $('#newmodel_base').value = '';
+    renderAll();
+    toast('已加进模型库：' + id);
+  } catch (e) { toast('添加失败：' + e.message); }
+};
+$('#modelrefresh').onclick = async () => {
+  state = await api('/api/state');
+  renderAll();
+};
+
+/* ---------- 插件 ---------- */
+function renderPluginList(meta) {
+  if (meta) state.plugins = meta;
+  const info = state.plugins || {items: [], errors: [], files: [], dir: ''};
+  const box = $('#pluginlist');
+  if (!box) return;
+  box.innerHTML = '';
+  (info.items || []).forEach(p => {
+    const bits = [p.file || ''];
+    if (p.ui) bits.push('有界面');
+    if (p.keys && p.keys.length) bits.push('开关 ' + p.keys.length + ' 项');
+    if (p.disabled) bits.push('已停用');
+    if (p.broken) bits.push('加载失败');
+    const btns = [];
+    if (p.disabled) btns.push(mkBtn('装回去', 'ghost sm', () => togglePlugin(p.id, true)));
+    else {
+      btns.push(mkBtn('停用', 'ghost sm', () => togglePlugin(p.id, false)));
+      btns.push(mkBtn('卸载', 'ghost sm', () => uninstallPlugin(p.id)));
+    }
+    box.appendChild(opsRow(p.name + '  ·  ' + p.id, bits.filter(Boolean).join('  ·  '), btns));
+  });
+  if (!(info.items || []).length) box.appendChild(opsHint('plugins/ 里还没有插件。'));
+  (info.errors || []).forEach(e => box.appendChild(opsHint('加载失败：' + e.file + ' — ' + e.error)));
+  $('#plugindir').textContent = '目录：' + (info.dir || '') + '（文件放进去就是装，删掉就是拆；装完立刻生效，不用重启）';
+}
+async function togglePlugin(id, enabled) {
+  try {
+    const j = await api('/api/plugins/toggle', {id, enabled});
+    state = j.state;
+    renderAll();
+    loadPlugins();
+    toast((enabled ? '已装回 ' : '已停用 ') + id);
+  } catch (e) { toast('操作失败：' + e.message); }
+}
+async function uninstallPlugin(id) {
+  try {
+    const j = await api('/api/plugins/uninstall', {id});
+    state = j.state;
+    renderAll();
+    toast('已卸载 ' + id + '（文件在 plugins/_trash/，随时能捞回来）');
+    location.reload();
+  } catch (e) { toast('卸载失败：' + e.message); }
+}
+function b64(buf) {
+  const bytes = new Uint8Array(buf);
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 0x8000)
+    out += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(out);
+}
+$('#pluginfile').onchange = async e => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  let installed = false;
+  for (const f of files) {
+    try {
+      const j = await api('/api/plugins/install', {name: f.name, data: b64(await f.arrayBuffer())});
+      state = j.state;
+      toast('已装 ' + f.name);
+      if (f.name.endsWith('.py')) installed = true;
+    } catch (err) { toast('装 ' + f.name + ' 失败：' + err.message); }
+  }
+  renderAll();
+  if (installed) loadPlugins();
+};
+$('#pluginrefresh').onclick = async () => {
+  state = await api('/api/state');
+  renderAll();
 };
 
 /* ---------- 管理 ---------- */
@@ -727,14 +891,67 @@ $('#recbtn').onclick = async () => {
   } catch (e) { toast('✗ ' + e.message); }
 };
 
+/* ---------- 插件（plugins/ 下的 <id>.py + <id>.ui.html + <id>.ui.js） ----------
+   页面里没有任何一个具体插件的代码：装一个插件就是往 plugins/ 里放三个文件，
+   拆就是删掉。插件自己注册 window.__pluginUI[id].init(分区, 宿主工具)。 */
+window.__pluginUI = window.__pluginUI || {};
+const PLUGIN_HOST = { api, toast, key: KEY };
+
+async function loadPlugins() {
+  let items = [];
+  try { items = (await api('/api/plugins')).items || []; } catch (e) { return; }
+  const nav = document.querySelector('nav');
+  const tabs = document.querySelectorAll('.tab');
+  const parent = tabs.length ? tabs[tabs.length - 1].parentNode : null;
+  const kq = KEY ? '?k=' + encodeURIComponent(KEY) : '';
+  for (const p of items) {
+    const btn = document.createElement('button');
+    btn.dataset.tab = 'plugin-' + p.id;
+    btn.textContent = p.name || p.id;
+    nav.appendChild(btn);
+    if (!p.ui || !parent) continue;
+    const sec = document.createElement('section');
+    sec.className = 'tab';
+    sec.id = 'tab-plugin-' + p.id;
+    parent.appendChild(sec);
+    try {
+      const res = await fetch('/api/plugin/' + encodeURIComponent(p.id) + '/ui.html' + kq);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      sec.innerHTML = await res.text();
+    } catch (e) {
+      sec.innerHTML = '<div class=pane><div class=card>插件「' + p.id + '」的界面没送来：' + e.message + '</div></div>';
+    }
+    await new Promise((done) => {
+      const sc = document.createElement('script');
+      sc.src = '/api/plugin/' + encodeURIComponent(p.id) + '/ui.js' + kq;
+      sc.onload = () => {
+        const mod = window.__pluginUI[p.id];
+        if (mod && mod.init) {
+          try { mod.init(sec, PLUGIN_HOST); } catch (e) { toast('插件界面起不来：' + e.message); }
+        }
+        done();
+      };
+      sc.onerror = () => { toast('插件「' + p.id + '」的脚本加载失败'); done(); };
+      document.body.appendChild(sc);
+    });
+  }
+}
 /* ---------- 标签页 ---------- */
-document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+function switchTab(b) {
   document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.id === 'tab-' + b.dataset.tab));
   if (b.dataset.tab === 'chat') $('#msg').focus();
   if (b.dataset.tab === 'ops') loadOps();
+  const pid = (b.dataset.tab || '').replace(/^plugin-/, '');
+  if (pid && b.dataset.tab !== pid) {
+    const mod = window.__pluginUI[pid];
+    if (mod && mod.enter) { try { mod.enter(); } catch (e) { /* 插件自己的问题，不打断页面 */ } }
+  }
+}
+document.querySelector('nav').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (b) switchTab(b);
 });
-
 refresh = async () => {
   try {
     state = await api('/api/state');
@@ -748,6 +965,7 @@ refresh = async () => {
 };
 addMsg('meta', '回答会结合本地记忆；对话超预算会自动压成摘要存进 journal/，此页刷新后对话清空、摘要与记忆保留。');
 refresh();
+loadPlugins();
 </script>
 </body>
 </html>
