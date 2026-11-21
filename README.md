@@ -1,5 +1,7 @@
 # md-memory-harness
 
+[English](README.en.md) | 简体中文
+
 [![tests](https://github.com/yxlh123/md-memory-harness/actions/workflows/tests.yml/badge.svg)](https://github.com/yxlh123/md-memory-harness/actions/workflows/tests.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
