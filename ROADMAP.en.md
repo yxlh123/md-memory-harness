@@ -73,7 +73,8 @@ Assessment: purely experiential; the change is concentrated in the forwarding in
 ## 7. Putting the memories directory under git — ✅ Completed (v2.15.0, 2026-11-21)
 
 The direction changed during implementation: **do not** stuff a `.git` into `memories/`; instead put `.memory-history/` next to it and operate with
-`git --git-dir=.memory-history --work-tree=memories`. Reason: `memories/` is quite likely already inside some project repository, and a nested `.git` would make the outer repository treat it as a gitlink, which is both hard to explain and easy to stumble on.
+`git --git-dir=.memory-history --work-tree=memories`. Reason: `memories/` is quite likely already inside some project repository, and
+a nested `.git` would make the outer repository treat it as a gitlink, which is both hard to explain and easy to stumble on.
 
 - save, soft delete, hard delete, supersede, restore, write back from history — one commit each; `memory_git=off` disables it, and without git installed it silently skips
 - cache files (`.index.json`/`.vectors.json`/`.usage.json`/`.stats.json`/`.trash/`) are written into `info/exclude`, so history holds only the memories themselves
